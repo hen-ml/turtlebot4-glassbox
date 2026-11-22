@@ -1349,6 +1349,10 @@ def nav_loop():
             recorder.log(scan, rec_grid, raw_path, path, dict(
                 pose=[ox, oy, oyaw], nav_active=active,
                 run_program=run_prog, current_cmd=cur_cmd,
+                # what the UI status line said at this step (e.g. "arrived (δ=…)",
+                # "blocked: no path") and any active base hazards — lets a replay
+                # show exactly what a status-only view showed, and why nav ended
+                status=_get('status'), hazards=list(_get('hazards') or []),
                 goal_odom=list(goal_odom) if goal_odom else None,
                 goal_local=list(goal_local) if goal_local else None,
                 goal_cell=[gr, gc] if active else None,
