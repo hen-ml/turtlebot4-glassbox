@@ -159,6 +159,25 @@ to localhost only, change `app.run(host='0.0.0.0', ...)` to `host='127.0.0.1'`.
 - `object_detection/training/` — optional custom-detector training pipelines
   (needs `ultralytics`; see the licensing note below)
 
+## Laptop LLM harness (experimental)
+
+A laptop on the same LAN can act as an **agent harness** for the robot: state a
+mission in free text, a local model (LM Studio / Ollama, OpenAI-compatible,
+nothing in the cloud) compiles it into a validated plan of tool calls — the
+robot's existing skills and `.toy` programs — you confirm **once**, and the
+harness drives it leg-by-leg over the same HTTP API the web UI uses. It
+verifies each leg, re-plans at most twice on failure, and never sits in the
+control loop. No map, no LLM on the robot, no new robot dependencies.
+
+```bash
+export TB4_PI_URL=http://<pi>:5000
+python3 -m harness --dry-run "push the ball to the wall"   # compile only, robot untouched
+python3 -m harness "push the ball to the wall"             # compile → confirm → drive
+```
+
+Design, safety model and literature positioning: [docs/laptop-harness.md](docs/laptop-harness.md).
+Harness code: `harness/` (stdlib only). Tests: `python3 tests/test_harness.py`.
+
 ## License
 
 Project code is **MIT** — see [LICENSE](LICENSE).
