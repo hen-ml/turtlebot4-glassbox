@@ -2277,6 +2277,11 @@ def get_state():
             'odom_y':       round(_state['odom_y'],   3),
             'odom_yaw':     round(math.degrees(_state['odom_yaw']), 1),
             'goal_odom':    _state['goal_odom'],
+            # Evidence checks in the UI compare the pose to the goal against the
+            # SAME tolerance the nav loop uses to declare arrival, and the planner's
+            # command against the twist actually published.
+            'goal_tol':     PUSH_GOAL_TOL if _state['goal_mode'] == 'push' else GOAL_TOL,
+            'cmd_sent':     _state['cmd_sent'],
             'ball_goal':    _state['ball_goal'],
             'battery_voltage': _state['battery_voltage'],
             'battery_percentage': _state['battery_percentage'],

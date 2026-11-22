@@ -42,6 +42,12 @@
         #det_list { padding: 10px; background: #0a0a0a; border: 1px solid #222; max-height: 200px; overflow-y: auto; border-radius: 3px; }
         .det-item { padding: 6px; margin: 3px 0; background: #1a1a1a; border-left: 3px solid #4a9; }
         .det-item span { color: #4a9; font-weight: bold; }
+        /* Evidence checks: cross-check one signal against another, never a verdict on its own. */
+        #checks { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+        .chk { padding: 5px 7px; background: #141414; border-left: 3px solid #666; font-size: 0.88em; line-height: 1.35; }
+        .chk.ok { border-left-color: #4a9; } .chk.bad { border-left-color: #e08a3c; } .chk.na { border-left-color: #666; }
+        .chk b { color: #ddd; font-weight: 600; }
+        .chk .src { color: #b9a35a; font-style: italic; font-size: 0.9em; }
         .status-bar { padding: 8px 10px; background: #1a1a1a; border-bottom: 1px solid #333; text-align: center; color: #888; }
         .status-bar .robot-tag { color:#557; margin-right: 14px; }
         .idle { color: #888; } .navigating { color: #4a9; } .finding { color: #db8; } .arrived { color: #4a9; }
@@ -136,6 +142,10 @@
     <div>Detections</div>
     <div id="det_list">none</div>
     <div id="match_info" class="lbl"></div>
+    <div id="checks_wrap">
+      <div class="lbl">Checks — evidence compared against other evidence</div>
+      <div id="checks"><div class="chk na">waiting for state…</div></div>
+    </div>
   </div>
 
   <!-- Row 3 RIGHT: knobs you touch rarely. -->
@@ -177,6 +187,58 @@ const IMG_REFRESH_MS = 500;
 // restores the feed). The lidar BEV always refreshes.
 let _camLive = true;
 
+// ── Evidence checks ─────────────────────────────────────────────────────────
+// Each row links two independent pieces of evidence so a person can see whether
+// they agree: pose vs goal (the nav loop's own arrival rule), wheel motion vs
+// navigation state, and camera range vs LiDAR range at a detection's bearing.
+// Hide with ?checks=0 (e.g. for a status-only session).
+const _showChecks = new URLSearchParams(location.search).get('checks') !== '0';
+if (!_showChecks) { const w = document.getElementById('checks_wrap'); if (w) w.style.display = 'none'; }
+let _prevOdom = null, _stillSince = null;
+function _esc(t) { return String(t).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+function renderChecks(s) {
+  if (!_showChecks) return;
+  const now = Date.now() / 1000, rows = [];
+  const row = (k, title, txt, src) => rows.push(`<div class="chk ${k}"><b>${title}:</b> ${txt} <span class="src">${src}</span></div>`);
+  // wheel motion from successive odometry samples
+  let speed = null, yawRate = null;
+  if (_prevOdom && now - _prevOdom.t > 0.05) {
+    const dt = now - _prevOdom.t;
+    speed = Math.hypot(s.odom_x - _prevOdom.x, s.odom_y - _prevOdom.y) / dt;
+    yawRate = Math.abs(((s.odom_yaw - _prevOdom.yaw + 540) % 360) - 180) / dt;   // deg/s
+  }
+  _prevOdom = {x: s.odom_x, y: s.odom_y, yaw: s.odom_yaw, t: now};
+  const moving = speed !== null && (speed > 0.03 || yawRate > 8);
+  if (moving) _stillSince = null; else if (_stillSince === null) _stillSince = now;
+  // 1. goal link
+  if (s.goal_odom) {
+    const d = Math.hypot(s.odom_x - s.goal_odom[0], s.odom_y - s.goal_odom[1]);
+    const tol = s.goal_tol || 0.25;
+    if (d < tol) row('ok', 'Goal', `${d.toFixed(2)} m from goal, inside the ${tol.toFixed(2)} m arrival tolerance → arrived`, 'pose vs goal');
+    else if (s.nav_active) row('na', 'Goal', `${d.toFixed(2)} m to go (arrives within ${tol.toFixed(2)} m)`, 'pose vs goal');
+    else row('bad', 'Goal', `stopped ${d.toFixed(2)} m short of the goal (arrival needs < ${tol.toFixed(2)} m)`, 'pose vs goal');
+  } else row('na', 'Goal', 'no goal set', 'plan');
+  // 2. motion vs navigation state
+  if (speed !== null) {
+    const still = _stillSince === null ? 0 : now - _stillSince;
+    const cs = s.cmd_sent && (now - s.cmd_sent.t) < 1.5 ? s.cmd_sent : null;
+    const cmdTxt = cs ? ` · last command ${cs.v.toFixed(2)} m/s, ${cs.w.toFixed(2)} rad/s` : '';
+    if (s.nav_active && !moving && still > 2) row('bad', 'Motion', `navigating, but the wheels have not moved for ${still.toFixed(0)} s${cmdTxt}`, 'nav state vs odometry');
+    else if (!s.nav_active && moving) row('na', 'Motion', `moving (${speed.toFixed(2)} m/s) without a navigation goal: a skill is steering directly${cmdTxt}`, 'nav state vs odometry');
+    else row('ok', 'Motion', `${s.nav_active ? 'navigating' : 'not navigating'}; wheels ${moving ? 'moving (' + speed.toFixed(2) + ' m/s)' : 'still'}${cmdTxt}`, 'nav state vs odometry');
+  }
+  // 3. bearing link per detection
+  for (const d of (s.detections || [])) {
+    const lbl = `“${_esc(d.label)}” ${(d.conf * 100).toFixed(0)}%`;
+    const cam = (d.p25_dist != null ? d.p25_dist : d.cam_dist);
+    if (cam == null || !(cam > 0)) { row('na', lbl, 'camera has no depth for this box', 'model guess + stereo'); continue; }
+    if (d.lidar_dist == null) { row('na', lbl, `camera ${cam.toFixed(2)} m; LiDAR sees nothing at that bearing`, 'camera vs LiDAR'); continue; }
+    const rel = Math.abs(cam - d.lidar_dist) / Math.min(cam, d.lidar_dist);
+    row(rel <= 0.5 ? 'ok' : 'bad', lbl, `camera ${cam.toFixed(2)} m vs LiDAR ${d.lidar_dist.toFixed(2)} m at the same bearing → ${rel <= 0.5 ? 'agree' : 'DISAGREE'}`, 'camera vs LiDAR; label is a model guess');
+  }
+  document.getElementById('checks').innerHTML = rows.join('');
+}
+
 function update() {
   // Refresh the live images FIRST, independent of the /state panel — a render
   // error (or a slow/failed /state) must never be able to freeze the feed.
@@ -212,6 +274,7 @@ function update() {
     } else {
       dl.textContent = 'none';
     }
+    renderChecks(s);
     const rb = document.getElementById('rec_btn');
     const rs = document.getElementById('rec_status');
     if (s.recording) {
