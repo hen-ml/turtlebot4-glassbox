@@ -1943,6 +1943,19 @@ class NavRobot:
         _set(status='push-to-goal timed out')
         return 'timeout'
 
+    def run_policy(self, path, gx=None, gy=None, max_time=90.0):
+        """RUN_POLICY: drive with a controller file (evo.policy_api contract), the
+        same file that was scored in simulation. Goal = (gx, gy) or the ball goal
+        marked in the UI. See policy_runner.py. Returns 'done' / 'settled' /
+        'timeout' / 'blocked' / 'no-goal' / 'error: ...'."""
+        import policy_runner
+        if not os.path.isabs(path):
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+        return policy_runner.run(path, get=_get, set_=_set, node=lambda: ros_node,
+                                 live_det=self._live_det, check=self._check,
+                                 goal=(gx, gy) if gx is not None and gy is not None else None,
+                                 max_time=float(max_time))
+
     def follow(self, name=None, standoff=None, fast=None, max_time=900):
         """Follow the CLOSEST `name`, AVOIDING OBSTACLES on the way — a person to
         help them carry things, a dog, a ball, anything nameable.
@@ -2133,6 +2146,7 @@ _PLAN_PHRASE = {
     'PUSH_THROUGH': 'push it to the wall',
     'PUSH_TO_WALL': 'push it to the wall',
     'PUSH_TO_GOAL': 'line up behind the ball & push it to your goal',
+    'RUN_POLICY':   'push the ball to your goal with the loaded controller',
     'FOLLOW':       'follow the target',
     'GO_TO':        'drive to the spot',
     'POINT':        'turn to face it',

@@ -53,3 +53,6 @@ test_dataset/
 
 # regenerable export artifact
 object_detection/yolov8s.onnx
+
+# controllers loaded by RUN_POLICY (research artefacts, not part of the repo)
+policies/
