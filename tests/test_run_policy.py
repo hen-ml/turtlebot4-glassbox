@@ -178,6 +178,24 @@ class TestObservationMatchesTheSimulator(unittest.TestCase):
         self.assertAlmostEqual(g[0], 1.0 - 0.5, places=3)
         self.assertAlmostEqual(g[1], 2.0 + 1.0, places=3)
 
+    def test_lidar_beams_in_the_robot_frame(self):
+        """A wall 1 m straight ahead of the robot, in the RPLIDAR's own frame (mounted
+        yaw +90 deg), must come out as the forward beam; nothing elsewhere = max."""
+        class Scan:
+            pass
+        sc = Scan()
+        sc.angle_min, sc.angle_increment, sc.range_min = -math.pi, math.radians(1.0), 0.15
+        sc.ranges = [float("inf")] * 360
+        fwd_lidar = math.atan2(-math.cos(0.0), math.sin(0.0))        # base bearing 0 in lidar angles
+        k = int(round((fwd_lidar - sc.angle_min) / sc.angle_increment)) % 360
+        for j in (k - 1, k, k + 1):
+            sc.ranges[j % 360] = 1.0
+        beams = policy_runner.scan_beams(sc)
+        self.assertEqual(len(beams), policy_runner.LIDAR_BEAMS)
+        self.assertAlmostEqual(beams[policy_runner.LIDAR_BEAMS // 2], 1.0)   # straight ahead
+        self.assertEqual(beams[0], policy_runner.LIDAR_MAX)                    # behind: nothing
+        self.assertEqual(sum(b < policy_runner.LIDAR_MAX for b in beams), 1)
+
     def test_toyscript_verb(self):
         import toyscript
         out = []

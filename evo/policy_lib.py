@@ -76,3 +76,21 @@ def heading_to(ox, oy, oyaw, target):
 
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
+
+
+def scan_bearing(i, n):
+    """Robot-frame bearing of lidar beam i of n (beam 0 straight back, n/2 ahead)."""
+    return wrap_angle(-math.pi + 2 * math.pi * i / n)
+
+
+def scan_min(scan, bearing, half_width):
+    """Closest lidar range within +-half_width of a robot-frame bearing (rad), or
+    None without a scan. Walls and obstacles; the ball only if it reaches the scan plane."""
+    if not scan:
+        return None
+    n = len(scan)
+    best = None
+    for i, r in enumerate(scan):
+        if abs(wrap_angle(scan_bearing(i, n) - bearing)) <= half_width + 1e-9:
+            best = r if best is None else min(best, r)
+    return best

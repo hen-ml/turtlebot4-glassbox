@@ -9,8 +9,9 @@ A policy is one Python file that defines either ``make_policy()`` or a class
 ``obs`` (Obs below) carries only what the robot has: odometry (x, y, yaw), the
 latest ball detection (or None if never seen): the ball's centre in the robot
 frame, its range from the camera and its age in seconds; the goal; a front-bumper
-flag (pressed during the last step); and (v, w) measured from odometry over the
-last step. The simulator produces exactly this, and the robot's runner
+flag (pressed during the last step); (v, w) measured from odometry over the
+last step; and the latest 2-D lidar scan (walls and obstacles; the ball only if it
+reaches the scan plane). The simulator produces exactly this, and the robot's runner
 (turtlebot4-glassbox policy_runner.py) converts its sensors into it. Commands are
 clamped by the runner; a policy cannot exceed the speed limits.
 
@@ -57,6 +58,10 @@ class Obs:
     bump: bool               # front bumper pressed during the last step (wall OR ball)
     v: float = 0.0           # forward speed measured from odometry over the last step
     w: float = 0.0           # yaw rate measured from odometry over the last step
+    scan: tuple | None = None  # lidar ranges (m), beam i at bearing -pi + 2*pi*i/len(scan)
+                               # in the robot frame (beam 0 straight back, len/2 straight ahead,
+                               # counter-clockwise); lidar max = nothing seen. None until the first scan
+    scan_age: float = 0.0    # s since that scan
 
 
 class PolicyRejected(Exception):

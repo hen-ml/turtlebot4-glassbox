@@ -18,6 +18,9 @@ observation here is built to match it exactly:
                             navigator keeps its hazard list for ~2 s for the UI, so
                             only fresh messages count)
     obs.v, obs.w            measured from odometry over the last step
+    obs.scan, obs.scan_age  the RPLIDAR scan as LIDAR_BEAMS ranges in the robot frame
+                            (beam i at bearing -pi + 2*pi*i/n, beam 0 straight back),
+                            invalid or empty = LIDAR_MAX, as the simulator gives it
 
 Commands are clamped to |v| <= 0.30 m/s and |w| <= 1.0 rad/s. The run ends when
 the policy returns done, after `max_time`, when the robot has been commanded
@@ -43,6 +46,49 @@ HAZARD_FRESH = 0.25    # s: a hazard message older than this is not "pressed now
 # values on the robot with these environment variables.
 CAM_X = float(os.environ.get("TB4_CAM_X", "0.08"))    # m, camera ahead of the base centre
 BALL_R = float(os.environ.get("TB4_BALL_R", "0.11"))  # m, ball radius
+
+
+LIDAR_BEAMS = 36           # must match the simulator (sensing.lidar_beams, lidar_max, lidar_min)
+LIDAR_MAX = 6.0
+LIDAR_MIN = 0.15
+LIDAR_WINDOW = math.radians(2.5)   # samples within this of a beam's bearing make up the beam
+
+
+def scan_beams(scan, n=None, rmax=None, rmin=None):
+    """A sensor_msgs/LaserScan from the navigator -> n ranges in the robot frame.
+
+    The RPLIDAR is mounted yaw +90 deg from base_link (tb4_claude_nav build_grid:
+    base_x = -r*sin(a), base_y = r*cos(a)), so base bearing b is lidar angle
+    atan2(-cos b, sin b). Each beam is the median of the valid samples within
+    LIDAR_WINDOW of it; none valid -> rmax (the simulator's 'nothing seen')."""
+    n = LIDAR_BEAMS if n is None else n
+    rmax = LIDAR_MAX if rmax is None else rmax
+    rmin = LIDAR_MIN if rmin is None else rmin
+    rng = list(scan.ranges)
+    inc, a0 = float(scan.angle_increment), float(scan.angle_min)
+    lo = max(rmin, float(getattr(scan, "range_min", 0.0) or 0.0))
+    out = []
+    for i in range(n):
+        b = -math.pi + 2 * math.pi * i / n
+        target = math.atan2(-math.cos(b), math.sin(b))
+        vals = []
+        k0 = int(round((target - a0) / inc)) if inc else 0
+        span = int(math.ceil(LIDAR_WINDOW / abs(inc))) if inc else 0
+        for k in range(k0 - span, k0 + span + 1):
+            j = k % len(rng)
+            ang = a0 + k * inc
+            if abs(_wrap(ang - target)) > LIDAR_WINDOW + 1e-9:
+                continue
+            r = rng[j]
+            if r is not None and math.isfinite(r) and lo <= r <= rmax:
+                vals.append(float(r))
+        if vals:
+            vals.sort()
+            m = len(vals) // 2
+            out.append(round(vals[m] if len(vals) % 2 else 0.5 * (vals[m - 1] + vals[m]), 3))
+        else:
+            out.append(rmax)
+    return tuple(out)
 
 
 def ball_in_robot_frame(det, cam_x=None, ball_r=None):
@@ -110,6 +156,7 @@ def run(path, get, set_, node, live_det, check, goal=None, max_time=90.0, name="
     v_sent = w_sent = 0.0
     v_meas = w_meas = 0.0
     prev_od = None
+    scan, last_scan_t = None, None
     still_since = None
     result = "timeout"
     set_(ball_goal=goal, goal_mode="push")           # a bump here is the ball, not a wall
@@ -145,8 +192,12 @@ def run(path, get, set_, node, live_det, check, goal=None, max_time=90.0, name="
             if prev_od is None or t_od - prev_od[3] > 1e-3:
                 prev_od = (ox, oy, oyaw, t_od)
             fresh_bump = "bump" in kinds and now - float(get("last_hazard_t") or 0.0) <= HAZARD_FRESH
+            sc, sc_t = get("scan"), get("scan_t")
+            if sc is not None and sc_t != last_scan_t:
+                scan, last_scan_t = scan_beams(sc), sc_t
+            scan_age = round(now - float(last_scan_t), 3) if scan is not None else 0.0
             obs = Obs(t=round(t, 3), x=ox, y=oy, yaw=oyaw, ball=ball, goal=goal,
-                      bump=fresh_bump, v=v_meas, w=w_meas)
+                      bump=fresh_bump, v=v_meas, w=w_meas, scan=scan, scan_age=scan_age)
             try:
                 v, w, done = clamp_cmd(policy.act(obs), V_MAX, W_MAX)
             except Exception as e:  # noqa: BLE001
@@ -155,6 +206,7 @@ def run(path, get, set_, node, live_det, check, goal=None, max_time=90.0, name="
             logf.write(json.dumps(dict(t=round(t, 3), x=round(ox, 3), y=round(oy, 3), yaw=round(oyaw, 3),
                                        ball=ball, raw=last_raw, bump=obs.bump, v=round(v, 3), w=round(w, 3),
                                        v_meas=round(v_meas, 3), w_meas=round(w_meas, 3),
+                                       scan=scan if scan is not None and scan_age < 0.05 else None,
                                        done=done)) + "\n")
             if done:
                 result = "done"
