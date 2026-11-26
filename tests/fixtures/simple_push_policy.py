@@ -21,12 +21,21 @@ class Policy:
     def reset(self, goal):
         self.goal = goal
         self.ball = None          # last ball estimate (odom)
+        self.ball_t = None        # obs.t of that estimate
         self.mode = "search"
+        self.belief = dict(ball=None, ball_t=None, mode=self.mode)
 
     def act(self, obs):
         b = L.ball_odom(obs)
         if b is not None and obs.ball["age"] < 1.0:
-            self.ball = b
+            self.ball, self.ball_t = b, obs.t
+        out = self._decide(obs)
+        # Optional self-report (evo.policy_api `belief`): the robot logs it and
+        # draws it on the map; it does not change what this controller does.
+        self.belief = dict(ball=self.ball, ball_t=self.ball_t, mode=self.mode)
+        return out
+
+    def _decide(self, obs):
         if self.ball is None:
             return 0.0, SEARCH_W
         if L.dist(self.ball, self.goal) < DONE_R:

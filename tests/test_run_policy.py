@@ -217,5 +217,110 @@ class TestObservationMatchesTheSimulator(unittest.TestCase):
         self.assertAlmostEqual(got["g"][1], 3.0, places=3)
         self.assertEqual(got["t"], 90.0)
 
+
+class TestPolicyBelief(unittest.TestCase):
+    """The controller's optional self-report: logged every tick, shown on the map
+    while it runs, cleared after, and never able to break a run."""
+
+    def setUp(self):
+        self.logdir = tempfile.mkdtemp()
+        self._saved = (policy_runner.CAM_X, policy_runner.BALL_R)
+        policy_runner.CAM_X, policy_runner.BALL_R = 0.0, 0.0
+
+    def tearDown(self):
+        policy_runner.CAM_X, policy_runner.BALL_R = self._saved
+        tb4._set(policy_belief=None)
+
+    def _ticks(self):
+        f = [x for x in os.listdir(self.logdir) if x.endswith(".jsonl")]
+        self.assertEqual(len(f), 1)
+        with open(os.path.join(self.logdir, f[0])) as fh:
+            return [x for x in map(json.loads, fh) if "kind" not in x]
+
+    def _run(self, policy, ball=(3.0, 3.0), goal=(2.0, 0.0), set_=None, max_time=4.0):
+        tb4._set(ball_goal=goal)
+        with FakeBase(ball) as base:
+            r = policy_runner.run(policy, get=tb4._get, set_=set_ or tb4._set,
+                                  node=lambda: tb4.ros_node, live_det=tb4.NavRobot()._live_det,
+                                  check=lambda: None, log_dir=self.logdir, max_time=max_time)
+        return r, base
+
+    def test_logged_shown_and_cleared(self):
+        pol = _write_policy(self.logdir,
+                            "        self.belief = dict(ball=(1.5, -0.5), ball_t=0.0, mode='probe')\n"
+                            "        return (0.0, 0.0, obs.t > 1.0)\n")
+        shown = []
+
+        def spy(**kw):
+            if "policy_belief" in kw:
+                shown.append(kw["policy_belief"])
+            tb4._set(**kw)
+        r, _ = self._run(pol, set_=spy)
+        self.assertEqual(r, "done")
+        ticks = self._ticks()
+        self.assertTrue(ticks)
+        for x in ticks:
+            self.assertEqual(x["belief"]["ball"], [1.5, -0.5])
+            self.assertEqual(x["belief"]["mode"], "probe")
+            self.assertAlmostEqual(x["belief"]["age"], x["t"], delta=0.01)   # ball_t = 0
+        self.assertIn({"ball": [1.5, -0.5], "age": 0.0, "mode": "probe"}, shown)
+        self.assertIsNone(shown[-1], "the map must not keep a finished run's belief")
+        self.assertIsNone(tb4._get("policy_belief"))
+
+    def test_malformed_belief_never_stops_a_run(self):
+        pol = _write_policy(self.logdir,
+                            "        self.belief = dict(ball=('a', 'b')) if obs.t < 0.5 else 'nonsense'\n"
+                            "        return (0.0, 0.0, obs.t > 1.0)\n")
+        r, _ = self._run(pol)
+        self.assertEqual(r, "done")
+        self.assertTrue(all(x["belief"] is None for x in self._ticks()))
+
+    def test_read_belief(self):
+        rb = policy_runner.read_belief
+
+        class Method:
+            def belief(self):
+                return {"ball": (1, 2), "ball_t": 1.0, "mode": "push"}
+
+        class NoBelief:
+            pass
+
+        class NaN:
+            belief = {"ball": (float("nan"), 0.0), "mode": "x"}
+
+        class Raises:
+            @property
+            def belief(self):
+                raise RuntimeError("boom")
+        self.assertEqual(rb(Method(), 3.5), {"ball": [1.0, 2.0], "age": 2.5, "mode": "push"})
+        self.assertIsNone(rb(NoBelief(), 1.0))
+        self.assertEqual(rb(NaN(), 1.0), {"mode": "x"})
+        self.assertIsNone(rb(Raises(), 1.0))
+
+    def test_fixture_reports_where_it_saw_the_ball(self):
+        self._run(POLICY, ball=(1.0, 0.2), goal=(2.6, 0.4), max_time=6.0)
+        beliefs = [x["belief"] for x in self._ticks() if x["belief"]]
+        self.assertTrue(beliefs)
+        self.assertLessEqual({b["mode"] for b in beliefs}, {"search", "approach", "push"})
+        first = next(b for b in beliefs if b.get("ball"))
+        self.assertLess(math.hypot(first["ball"][0] - 1.0, first["ball"][1] - 0.2), 0.3)
+
+    def test_map_marker_and_state(self):
+        self.assertEqual(tb4.belief_label({"ball": [1, 2], "mode": "push", "age": 3.21}),
+                         "BELIEF push 3.2s")
+        self.assertIsNone(tb4.belief_label({"mode": "search"}))      # no ball: nothing to draw
+        self.assertIsNone(tb4.belief_label(None))
+        import cv2
+        import numpy as np
+        plain = tb4.render_lidar_png(None, [], None)
+        marked = tb4.render_lidar_png(None, [], None, belief_local=(1.0, 0.0), belief_label="BELIEF")
+        a, b = (cv2.imdecode(np.frombuffer(p, np.uint8), cv2.IMREAD_COLOR) for p in (plain, marked))
+        self.assertGreater(int((a != b).any(axis=2).sum()), 50)
+        tb4._set(policy_belief={"ball": [1.0, 2.0], "mode": "push"})
+        with tb4.app.test_client() as c:
+            self.assertEqual(c.get("/state").get_json()["policy_belief"],
+                             {"ball": [1.0, 2.0], "mode": "push"})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -27,6 +27,11 @@ the policy returns done, after `max_time`, when the robot has been commanded
 still for 3 s (same rule as the simulator), or on cliff / wheel drop. Every tick
 is logged to ~/policy_runs/<time>_<policy>.jsonl for replay and analysis.
 
+If the policy reports what it believes (an optional `belief`, see evo.policy_api),
+each tick also logs it as `belief` and the BEV draws its ball estimate, so the gap
+between what the camera saw (`raw`/`ball`) and what the controller acted on is
+visible live and recoverable afterwards. Policies that report nothing log null.
+
 This module has no ROS imports: NavRobot.run_policy passes in the accessors.
 """
 from __future__ import annotations
@@ -111,6 +116,35 @@ def ball_in_robot_frame(det, cam_x=None, ball_r=None):
     d = surf + ball_r
     return dict(x_loc=cam_x + d * math.cos(brg), y_loc=d * math.sin(brg), dist=d)
 LOG_DIR = os.path.expanduser("~/policy_runs")
+
+
+def read_belief(policy, t):
+    """The policy's optional self-report (evo.policy_api: `belief`), read after
+    every act(): where it thinks the ball is, how old that estimate is, and what
+    it is doing. Normalised to {ball: [x, y] odom, age: s, mode: str}, keeping
+    only the keys it gave; None if it reports nothing usable. Never raises: the
+    report feeds the log and the BEV, not control, so a malformed one is dropped
+    rather than ending the run."""
+    try:
+        b = getattr(policy, "belief", None)
+        if callable(b):
+            b = b()
+        if not isinstance(b, dict):
+            return None
+        out = {}
+        ball = b.get("ball")
+        if ball is not None:
+            x, y = float(ball[0]), float(ball[1])
+            if math.isfinite(x) and math.isfinite(y):
+                out["ball"] = [round(x, 3), round(y, 3)]
+        bt = b.get("ball_t")
+        if "ball" in out and bt is not None and math.isfinite(float(bt)):
+            out["age"] = round(max(0.0, float(t) - float(bt)), 2)
+        if b.get("mode") is not None:
+            out["mode"] = str(b["mode"])[:32]
+        return out or None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _wrap(a):
@@ -207,11 +241,13 @@ def run(path, get, set_, node, live_det, check, goal=None, max_time=90.0, name="
             except Exception as e:  # noqa: BLE001
                 result = f"error: {type(e).__name__}: {e}"
                 break
+            belief = read_belief(policy, obs.t)
+            set_(policy_belief=belief)
             logf.write(json.dumps(dict(t=round(t, 3), x=round(ox, 3), y=round(oy, 3), yaw=round(oyaw, 3),
                                        ball=ball, raw=last_raw, bump=obs.bump, v=round(v, 3), w=round(w, 3),
                                        v_meas=round(v_meas, 3), w_meas=round(w_meas, 3),
                                        scan=scan if scan is not None and scan_age < 0.05 else None,
-                                       done=done)) + "\n")
+                                       belief=belief, done=done)) + "\n")
             if done:
                 result = "done"
                 break
@@ -235,7 +271,7 @@ def run(path, get, set_, node, live_det, check, goal=None, max_time=90.0, name="
         n = node()
         if n is not None:
             n.send_twist(0.0, 0.0)
-        set_(goal_mode="move")
+        set_(goal_mode="move", policy_belief=None)
         logf.write(json.dumps(dict(kind="end", result=result, t=round(clock() - t0, 3))) + "\n")
         logf.close()
     set_(status=f"policy {tag}: {result}")

@@ -204,6 +204,7 @@ _state = {
     "ball_goal":          None,   # human-set odom (x, y) the ball should be pushed to
     "ball_mark":          None,   # last known ball position (odom x, y)
     "push_from":          None,   # stance point on the goal↔ball line (odom x, y)
+    "policy_belief":      None,   # RUN_POLICY controller's self-report {ball:[x,y] odom, age, mode}
     # Dataset recording (UI-controlled)
     "recording":          False,
     "record_drive":       "",     # current drive dir name
@@ -423,8 +424,22 @@ def smooth_path(grid: np.ndarray, path: list) -> list:
 
 
 # ── Lidar visualisation ───────────────────────────────────────────────────────
+def belief_label(pb):
+    """BEV caption for a RUN_POLICY belief: 'BELIEF push 3.2s' (mode and age only
+    when the policy reported them). None when there is no belief to draw."""
+    if not pb or not pb.get('ball'):
+        return None
+    parts = ['BELIEF']
+    if pb.get('mode'):
+        parts.append(str(pb['mode']))
+    if pb.get('age') is not None:
+        parts.append(f"{float(pb['age']):.1f}s")
+    return ' '.join(parts)
+
+
 def render_lidar_png(scan, path, goal_local, detections=None, look_local=None, goal_mode='move',
-                     ball_goal_local=None, ball_local=None, push_from_local=None) -> bytes:
+                     ball_goal_local=None, ball_local=None, push_from_local=None,
+                     belief_local=None, belief_label=None) -> bytes:
     img   = np.full((VIZ_SIZE, VIZ_SIZE, 3), (18,18,18), dtype=np.uint8)
     cx = cy = VIZ_SIZE // 2
     scale   = VIZ_SIZE / (GRID_CELLS * GRID_RES)
@@ -510,6 +525,21 @@ def render_lidar_png(scan, path, goal_local, detections=None, look_local=None, g
         cv2.circle(img, sp, 7, (230, 230, 230), 1)
         cv2.putText(img, "STANCE", (sp[0]+10, sp[1]-8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.34, (200, 200, 200), 1, cv2.LINE_AA)
+    # RUN_POLICY: where the CONTROLLER says the ball is (its own estimate, which
+    # can be stale). Hollow ring + cross so it reads as a belief, not a sensor
+    # reading; a dotted line to BALL (the latest detection) shows the gap.
+    if belief_local:
+        pp, col = w2p(*belief_local), (255, 255, 120)          # pale cyan
+        if ball_local:
+            bp = w2p(*ball_local)
+            for i in range(0, 16, 2):
+                t0, t1 = i / 16.0, (i + 1) / 16.0
+                cv2.line(img, (int(pp[0] + (bp[0]-pp[0])*t0), int(pp[1] + (bp[1]-pp[1])*t0)),
+                              (int(pp[0] + (bp[0]-pp[0])*t1), int(pp[1] + (bp[1]-pp[1])*t1)), col, 1)
+        cv2.circle(img, pp, 11, col, 2)
+        cv2.drawMarker(img, pp, col, cv2.MARKER_CROSS, 14, 1)
+        cv2.putText(img, belief_label or "BELIEF", (pp[0]+13, pp[1]-8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, col, 1, cv2.LINE_AA)
 
     cv2.circle(img, (cx,cy), 8, (30,100,255), -1)
     cv2.arrowedLine(img, (cx,cy), (cx,cy-22), (200,200,255), 2, tipLength=0.4)
@@ -824,12 +854,15 @@ class NavNode(Node):
             _state['scan_t']    = time.time()
             _ox, _oy, _oyaw = _state['odom_x'], _state['odom_y'], _state['odom_yaw']
             _loc = lambda pt: (_odom_to_local(pt, _ox, _oy, _oyaw) if pt else None)
+            _pb = _state['policy_belief'] or {}
             _state['lidar_png'] = render_lidar_png(
                 msg, _state['path'], _state['goal_local'], _state['detections'],
                 _state['look_local'], _state['goal_mode'],
                 ball_goal_local=_loc(_state['ball_goal']),
                 ball_local=_loc(_state['ball_mark']),
-                push_from_local=_loc(_state['push_from']))
+                push_from_local=_loc(_state['push_from']),
+                belief_local=_loc(_pb.get('ball')),
+                belief_label=belief_label(_pb))
 
     def _img_cb(self, msg: Image):
         try:
@@ -1363,7 +1396,8 @@ def nav_loop():
                                  range_min=float(scan.range_min),
                                  range_max=float(scan.range_max),
                                  n=len(scan.ranges)),
-                detections=dets_snap),
+                detections=dets_snap,
+                policy_belief=_get('policy_belief')),
                 frame=frame_rgb, frame_dets=dets_snap)
 
         time.sleep(0.05)
@@ -2275,7 +2309,8 @@ def _run_program(meta, display=None):
         # handling), so reset it here along with the other per-run state.
         _set(run_active=False, nav_active=False, target_color=None,
              follow_target=None, follow_standoff=None, follow_scan_first=False,
-             follow_fast=False, goal_mode='move', push_from=None, ball_mark=None)
+             follow_fast=False, goal_mode='move', push_from=None, ball_mark=None,
+             policy_belief=None)
 
 
 # ── Flask routes ──────────────────────────────────────────────────────────────
@@ -2305,6 +2340,7 @@ def get_state():
             'odom_yaw':     round(math.degrees(_state['odom_yaw']), 1),
             'goal_odom':    _state['goal_odom'],
             'ball_goal':    _state['ball_goal'],
+            'policy_belief': _state['policy_belief'],
             'battery_voltage': _state['battery_voltage'],
             'battery_percentage': _state['battery_percentage'],
             'docked':       _state['docked'],

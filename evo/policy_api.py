@@ -15,6 +15,15 @@ reaches the scan plane). The simulator produces exactly this, and the robot's ru
 (turtlebot4-glassbox policy_runner.py) converts its sensors into it. Commands are
 clamped by the runner; a policy cannot exceed the speed limits.
 
+Optionally, the object may expose ``belief`` (a dict, or a method returning one)
+to say what it currently believes; the robot's runner reads it after every
+``act()``, logs it and draws it on the operator's map. It never affects control,
+and a runner that does not know it (the simulator) simply ignores it:
+
+    ball    (x, y) in odom, where the policy thinks the ball is (None = no idea)
+    ball_t  obs.t at which it last updated that estimate (shown as its age)
+    mode    a short label for what it is doing ("search", "push", ...)
+
 Policy files are LLM-written, so ``load_policy`` checks them before running:
 imports must come from ``ALLOWED_IMPORTS`` and a list of builtins/dunders that
 would reach the file system or the interpreter is refused. This is a guard
