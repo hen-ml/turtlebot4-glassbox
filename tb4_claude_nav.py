@@ -904,6 +904,7 @@ class NavNode(Node):
             else:
                 x_loc, y_loc, dist = cam_x, cam_y, cam_dist   # raw OAK stereo
             dets.append(dict(
+                t=time.time(),                       # arrival; RUN_POLICY reports age from it
                 label=label,
                 conf=float(hyp.score),
                 x_loc=x_loc, y_loc=y_loc,

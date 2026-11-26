@@ -41,7 +41,8 @@ from evo.policy_api import Obs, clamp_cmd, load_policy
 V_MAX, W_MAX = 0.30, 1.0
 TICK = 0.10            # s, 10 Hz like the simulator
 SETTLE = 3.0           # s commanded still -> end
-HAZARD_FRESH = 0.25    # s: a hazard message older than this is not "pressed now"
+HAZARD_FRESH = 0.08    # s: under one control step: "pressed during the last step", as the simulator;
+                       # the Create 3 streams /hazard_detection while a bumper is pressed
 # Must match the simulator (sensing.cam_x, physics.ball_radius); set the measured
 # values on the robot with these environment variables.
 CAM_X = float(os.environ.get("TB4_CAM_X", "0.08"))    # m, camera ahead of the base centre
@@ -176,9 +177,12 @@ def run(path, get, set_, node, live_det, check, goal=None, max_time=90.0, name="
             if det is not None and det is not last_obj:      # a new frame saw the ball
                 last_obj = det
                 last_det = ball_in_robot_frame(det)
+                # age from when the detection arrived (the navigator stamps it), as the
+                # simulator counts it; fall back to this tick if it is not stamped
+                t_det = det.get("t")
                 last_raw = dict(x_loc=round(float(det["x_loc"]), 3), y_loc=round(float(det["y_loc"]), 3),
                                 dist=round(float(det.get("dist", 0.0)), 3))
-                arrived = now
+                arrived = now if t_det is None else min(now, float(t_det))
             ball = None
             if last_det is not None:
                 ball = dict(last_det, age=round(now - arrived, 3))
