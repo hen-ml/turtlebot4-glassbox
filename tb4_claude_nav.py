@@ -1943,7 +1943,21 @@ class NavRobot:
         _set(status='push-to-goal timed out')
         return 'timeout'
 
-    def run_policy(self, path, gx=None, gy=None, max_time=90.0):
+    def push_to_goal_rel(self, fwd, left, max_time=90.0):
+        """PUSH_TO_GOAL_REL: the hand-written push skill with the goal (fwd, left)
+        metres from where the robot stands now (a study layout's goal from its
+        taped start), and the same 90 s limit RUN_POLICY has: the study baseline."""
+        import policy_runner
+        gx, gy = policy_runner.goal_from_start((fwd, left), float(_get('odom_x')),
+                                               float(_get('odom_y')), float(_get('odom_yaw')))
+        return self.push_to_goal(gx, gy, max_time=float(max_time))
+
+    def run_policy_rel(self, path, fwd, left, max_time=90.0):
+        """RUN_POLICY_REL: like run_policy, with the goal (fwd, left) metres from
+        where the robot stands now — a study layout's goal from its taped start."""
+        return self.run_policy(path, max_time=max_time, rel=(fwd, left))
+
+    def run_policy(self, path, gx=None, gy=None, max_time=90.0, rel=None):
         """RUN_POLICY: drive with a controller file (evo.policy_api contract), the
         same file that was scored in simulation. Goal = (gx, gy) or the ball goal
         marked in the UI. See policy_runner.py. Returns 'done' / 'settled' /
@@ -1954,7 +1968,7 @@ class NavRobot:
         return policy_runner.run(path, get=_get, set_=_set, node=lambda: ros_node,
                                  live_det=self._live_det, check=self._check,
                                  goal=(gx, gy) if gx is not None and gy is not None else None,
-                                 max_time=float(max_time))
+                                 goal_rel=rel, max_time=float(max_time))
 
     def follow(self, name=None, standoff=None, fast=None, max_time=900):
         """Follow the CLOSEST `name`, AVOIDING OBSTACLES on the way — a person to
@@ -2147,6 +2161,8 @@ _PLAN_PHRASE = {
     'PUSH_TO_WALL': 'push it to the wall',
     'PUSH_TO_GOAL': 'line up behind the ball & push it to your goal',
     'RUN_POLICY':   'push the ball to your goal with the loaded controller',
+    'RUN_POLICY_REL': 'push the ball to the layout goal with the loaded controller',
+    'PUSH_TO_GOAL_REL': 'line up behind the ball & push it to the layout goal',
     'FOLLOW':       'follow the target',
     'GO_TO':        'drive to the spot',
     'POINT':        'turn to face it',

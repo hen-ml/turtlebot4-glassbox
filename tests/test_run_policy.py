@@ -42,6 +42,13 @@ class TestRunPolicy(unittest.TestCase):
     def setUp(self):
         self.logdir = tempfile.mkdtemp()
         policy_runner.LOG_DIR = self.logdir
+        # FakeBase publishes the ball centre relative to the base, so no camera
+        # offset or radius to add in this world.
+        self._saved = (policy_runner.CAM_X, policy_runner.BALL_R)
+        policy_runner.CAM_X, policy_runner.BALL_R = 0.0, 0.0
+
+    def tearDown(self):
+        policy_runner.CAM_X, policy_runner.BALL_R = self._saved
 
     def _run(self, ball, goal, max_time=60.0):
         tb4._set(ball_goal=goal)
@@ -98,6 +105,99 @@ class TestRunPolicy(unittest.TestCase):
         self.assertIn(r, ("done", "settled", "timeout"))
         self.assertLess(time.time() - t0, 10)
 
+
+def _write_policy(dirname, body):
+    path = os.path.join(dirname, "p.py")
+    with open(path, "w") as f:
+        f.write("class Policy:\n    def reset(self, goal):\n        self.goal = goal\n"
+                "    def act(self, obs):\n" + body)
+    return path
+
+
+class TestObservationMatchesTheSimulator(unittest.TestCase):
+    """The robot must hand the policy what the simulator does (evo.policy_api)."""
+
+    def setUp(self):
+        self.logdir = tempfile.mkdtemp()
+
+    def _log(self):
+        f = [x for x in os.listdir(self.logdir) if x.endswith(".jsonl")][-1]
+        with open(os.path.join(self.logdir, f)) as fh:
+            return [json.loads(x) for x in fh]
+
+    def _run(self, policy, ball=(3.0, 3.0), goal=(2.0, 0.0), state=None, **kw):
+        tb4._set(ball_goal=goal)
+        with FakeBase(ball) as base:
+            if state:
+                tb4._set(**state)                 # after FakeBase, which resets the world
+            r = policy_runner.run(policy, get=tb4._get, set_=tb4._set, node=lambda: tb4.ros_node,
+                                  live_det=tb4.NavRobot()._live_det, check=lambda: None,
+                                  log_dir=self.logdir, **kw)
+        return r, base
+
+    def test_ball_is_its_centre_in_the_robot_frame(self):
+        b = policy_runner.ball_in_robot_frame
+        # p25 depth (axial) 1.0 m straight ahead -> centre 1.0 + r ahead of the lens
+        d = b(dict(x_loc=1.0, y_loc=0.0, dist=1.0, p25_dist=1.0), cam_x=0.08, ball_r=0.11)
+        self.assertAlmostEqual(d["x_loc"], 0.08 + 1.11, places=6)
+        self.assertAlmostEqual(d["dist"], 1.11, places=6)
+        # p25 depth at 30 deg is axial: range = 1 / cos 30
+        a = math.radians(30)
+        d = b(dict(x_loc=math.cos(a), y_loc=math.sin(a), dist=1.0, p25_dist=1.0), cam_x=0.0, ball_r=0.0)
+        self.assertAlmostEqual(d["dist"], 1.0 / math.cos(a), places=6)
+        # raw OAK spatial distance is already a range
+        d = b(dict(x_loc=math.cos(a), y_loc=math.sin(a), dist=1.0, p25_dist=None), cam_x=0.0, ball_r=0.1)
+        self.assertAlmostEqual(d["dist"], 1.1, places=6)
+        self.assertAlmostEqual(math.atan2(d["y_loc"], d["x_loc"]), a, places=6)
+
+    def test_bump_is_only_a_fresh_hazard(self):
+        pol = _write_policy(self.logdir, "        return (0.0, 0.0, bool(obs.bump))\n")
+        bump = [{"type": "bump", "where": "front"}]
+        r, _ = self._run(pol, max_time=4.0, state=dict(hazards=bump, last_hazard_t=time.time() - 1.5))
+        self.assertEqual(r, "settled", "a 1.5 s old bump must not count")
+        r, _ = self._run(pol, max_time=4.0, state=dict(hazards=bump, last_hazard_t=time.time() + 60))
+        self.assertEqual(r, "done", "a fresh bump must count")
+        tb4._set(hazards=[], last_hazard_t=0.0)
+
+    def test_v_and_w_are_measured_from_odometry(self):
+        pol = _write_policy(self.logdir, "        return (0.2, 0.5, obs.t > 2.0)\n")
+        r, _ = self._run(pol, max_time=5.0)
+        ticks = [x for x in self._log() if "v_meas" in x and x["t"] > 1.0]
+        self.assertTrue(ticks)
+        self.assertAlmostEqual(sum(x["v_meas"] for x in ticks) / len(ticks), 0.2, delta=0.04)
+        self.assertAlmostEqual(sum(x["w_meas"] for x in ticks) / len(ticks), 0.5, delta=0.08)
+
+    def test_goal_relative_to_the_start_pose(self):
+        pol = _write_policy(self.logdir, "        return (0.0, 0.0, True)\n")
+        tb4._set(ball_goal=None)
+        with FakeBase((3.0, 3.0), pose=(1.0, 2.0, math.pi / 2)):
+            policy_runner.run(pol, get=tb4._get, set_=tb4._set, node=lambda: tb4.ros_node,
+                              live_det=tb4.NavRobot()._live_det, check=lambda: None,
+                              log_dir=self.logdir, goal_rel=(1.0, 0.5))
+        g = self._log()[0]["goal"]
+        self.assertAlmostEqual(g[0], 1.0 - 0.5, places=3)
+        self.assertAlmostEqual(g[1], 2.0 + 1.0, places=3)
+
+    def test_toyscript_verb(self):
+        import toyscript
+        out = []
+        it = toyscript.Interpreter(toyscript.MockRobot(log=out.append), log=out.append)
+        it.run('SET r = RUN_POLICY_REL("policies/current.py", 1.5, -0.25)\n')
+        self.assertEqual(it.env["r"], "done")
+        self.assertTrue(any("RUN_POLICY_REL" in x and "fwd=1.50" in x for x in out), out)
+        it.run('SET b = PUSH_TO_GOAL_REL(1.5, -0.25)\n')
+        self.assertEqual(it.env["b"], "at goal")
+
+    def test_baseline_goal_relative_to_the_start_pose(self):
+        got = {}
+        nav = tb4.NavRobot()
+        nav.push_to_goal = lambda gx, gy, max_time=None: got.update(g=(gx, gy), t=max_time) or "at goal"
+        with FakeBase((3.0, 3.0), pose=(1.0, 2.0, math.pi / 2)):
+            r = nav.push_to_goal_rel(1.0, 0.5)
+        self.assertEqual(r, "at goal")
+        self.assertAlmostEqual(got["g"][0], 0.5, places=3)
+        self.assertAlmostEqual(got["g"][1], 3.0, places=3)
+        self.assertEqual(got["t"], 90.0)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
