@@ -133,8 +133,18 @@ HAZARD_STOP   = {1, 2, 4}        # bump, cliff, wheel_drop → halt navigation
 NN_TOPIC      = "/oakd/nn/spatial_detections"     # on-camera YOLO spatial (OAK-D VPU)
 DET_CONF_MIN  = 0.3       # drop detections below this confidence (cut false positives)
 CAM_TOPIC     = "/oakd/rgb/preview/image_raw"      # OAK-D RGB preview
-CAM_FX        = 325.95    # OAK-D 416 preview intrinsics (from camera_info)
-CAM_CX        = 212.43
+# OAK-D 416 preview intrinsics. The preview is the CENTRE 720x720 square of the
+# 1280x720 RGB frame resized to 416 (keep-aspect crop; the stereo depth is aligned
+# to the same 1280x720 frame, which is why _p25_depth uses centre-square geometry).
+# From /oakd/rgb/camera_info (fx 1002.91, cx 653.62): fx = 1002.91*416/720,
+# cx = (653.62 - 280)*416/720. /oakd/rgb/preview/camera_info reports fx 325.95: it
+# scales the full WIDTH (1280 -> 416) as if the frame were squashed, which made the
+# preview look 65 deg wide instead of 39.5 and overstated every off-centre bearing
+# up to ~1.7x, so a static object swung across the map as it moved in the image.
+# Measured on the robot 2026-11-26: pairs of sightings of a static object taken while
+# turning in place agree best at fx 565-580; the ball's scatter fell 7.2 -> 2.1 cm.
+CAM_FX        = 579.45
+CAM_CX        = 215.86
 DEPTH_TOPIC   = "/oakd/stereo/image_raw"   # raw stereo depth (16UC1 mm) for p25 distance
 IMG_REFRESH_HZ = 2.0       # 2 fps
 # ─────────────────────────────────────────────────────────────────────────────

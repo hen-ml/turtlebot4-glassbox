@@ -94,7 +94,7 @@ class FakeBase:
     detection when it is in the field of view, and drives/serves go_to goals the
     way nav_loop does."""
 
-    FOV_HALF = 0.58          # rad — OAK-D 416 preview is ~65 deg across
+    FOV_HALF = 0.345         # rad — the 416 preview (centre crop) is ~39.5 deg across, see CAM_FX
     CONTACT = 0.30           # m — robot centre to ball centre while pushing
 
     def __init__(self, ball, pose=(0.0, 0.0, 0.0), rate=100.0):

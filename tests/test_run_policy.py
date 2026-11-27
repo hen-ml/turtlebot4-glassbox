@@ -353,5 +353,15 @@ class TestPolicyBelief(unittest.TestCase):
                              {"ball": [1.0, 2.0], "mode": "push"})
 
 
+class TestCameraIntrinsics(unittest.TestCase):
+    def test_preview_is_the_centre_crop_of_the_720p_frame(self):
+        """The 416 preview is the centre 720x720 of the 1280x720 frame (fx 1002.91,
+        cx 653.62), not the whole width squashed: ~39.5 deg across, not 65."""
+        self.assertAlmostEqual(tb4.CAM_FX, 1002.91 * 416 / 720, delta=0.5)
+        self.assertAlmostEqual(tb4.CAM_CX, (653.62 - 280) * 416 / 720, delta=0.5)
+        hfov = 2 * math.degrees(math.atan(208 / tb4.CAM_FX))
+        self.assertAlmostEqual(hfov, 39.5, delta=0.3)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
