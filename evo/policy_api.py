@@ -7,8 +7,9 @@ A policy is one Python file that defines either ``make_policy()`` or a class
     act(obs)     returns (v, w) or (v, w, done): m/s forward, rad/s left-positive
 
 ``obs`` (Obs below) carries only what the robot has: odometry (x, y, yaw), the
-latest ball detection (or None if never seen): the ball's centre in the robot
-frame, its range from the camera and its age in seconds; the goal; a front-bumper
+ball where it was last seen (or None if never seen): its centre in the robot
+frame NOW, its range from the camera and the age of that sighting in seconds;
+the goal; a front-bumper
 flag (pressed during the last step); (v, w) measured from odometry over the
 last step; and the latest 2-D lidar scan (walls and obstacles; the ball only if it
 reaches the scan plane). The simulator produces exactly this, and the robot's runner
@@ -62,7 +63,10 @@ class Obs:
     x: float                 # odom pose
     y: float
     yaw: float
-    ball: dict | None        # {x_loc, y_loc, dist, age} robot frame at capture; None = never seen
+    ball: dict | None        # {x_loc, y_loc, dist, age}: where the ball was last seen, in the robot
+                             # frame NOW (the sighting is placed on the map with the pose at capture
+                             # and stays put there; a static ball's odom point does not move as the
+                             # robot does); age = s since that frame; None = never seen
     goal: tuple              # (x, y) odom
     bump: bool               # front bumper pressed during the last step (wall OR ball)
     v: float = 0.0           # forward speed measured from odometry over the last step

@@ -31,9 +31,10 @@ def local_to_odom(pt, ox, oy, oyaw):
 
 
 def ball_odom(obs):
-    """The latest ball detection in odom, using the CURRENT pose (exactly what the
-    robot does; with detection latency this is wrong while turning). None if the
-    ball has never been seen."""
+    """Where the ball was last seen, in odom. obs.ball is already relative to the
+    current pose (the runner placed the sighting with the pose at capture), so
+    this is the same odom point every tick until a new frame: a static ball stays
+    put. None if the ball has never been seen."""
     if obs.ball is None:
         return None
     return local_to_odom((obs.ball["x_loc"], obs.ball["y_loc"]), obs.x, obs.y, obs.yaw)

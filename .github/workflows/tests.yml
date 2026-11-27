@@ -57,5 +57,11 @@ jobs:
       - name: Run the closed-loop push tests
         run: python tests/test_push_to_goal.py
 
+      - name: Static ball stays put on the map (capture-time placement)
+        run: python tests/test_capture_pose.py
+
+      - name: RUN_POLICY tests
+        run: python tests/test_run_policy.py
+
       - name: DSL smoke run against MockRobot
         run: python toyscript.py programs/push_ball_to_goal.toy

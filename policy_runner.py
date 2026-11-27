@@ -5,14 +5,18 @@ act(obs) -> (v, w) or (v, w, done). The same file runs in a simulator, so the
 observation here is built to match it exactly:
 
     obs.x, obs.y, obs.yaw   odometry
-    obs.ball                latest 'ball' detection, as the simulator defines it:
-                            {x_loc, y_loc} = the ball's CENTRE in the robot frame,
+    obs.ball                where the ball was last seen, as the simulator defines it:
+                            {x_loc, y_loc} = the ball's CENTRE in the robot frame NOW,
                             dist = range from the camera to that centre, age = s
-                            since it arrived. The camera reports the visible surface
-                            relative to the lens, so we add the ball radius along
-                            the ray and the camera's offset (TB4_BALL_R, TB4_CAM_X).
-                            It stays after the ball leaves view, with age growing;
-                            None until first seen.
+                            since the frame was taken. Each sighting is placed on the
+                            map ONCE, with the pose the robot had when the frame was
+                            captured (the navigator's capture_pose), and re-expressed
+                            relative to the robot every tick, so a static ball stays
+                            put however the robot moves between frames. The camera
+                            reports the visible surface relative to the lens, so we
+                            add the ball radius along the ray and the camera's offset
+                            (TB4_BALL_R, TB4_CAM_X). It stays after the ball leaves
+                            view, with age growing; None until first seen.
     obs.goal                the ball goal (marked in the UI, or given)
     obs.bump                a bump hazard message arrived since the last step (the
                             navigator keeps its hazard list for ~2 s for the UI, so
@@ -41,6 +45,7 @@ import math
 import os
 import time
 
+from capture_pose import local_to_odom, odom_to_local
 from evo.policy_api import Obs, clamp_cmd, load_policy
 
 V_MAX, W_MAX = 0.30, 1.0
@@ -187,7 +192,7 @@ def run(path, get, set_, node, live_det, check, goal=None, max_time=90.0, name="
                                cam_x=CAM_X, ball_r=BALL_R)) + "\n")
 
     t0 = clock()
-    last_det, last_obj, last_raw, arrived = None, None, None, None
+    ball_odom, last_key, last_raw, arrived = None, None, None, None
     v_sent = w_sent = 0.0
     v_meas = w_meas = 0.0
     prev_od = None
@@ -207,20 +212,33 @@ def run(path, get, set_, node, live_det, check, goal=None, max_time=90.0, name="
             if "cliff" in kinds or "wheel_drop" in kinds:
                 result = "blocked"
                 break
-            det = live_det(name)
-            if det is not None and det is not last_obj:      # a new frame saw the ball
-                last_obj = det
-                last_det = ball_in_robot_frame(det)
-                # age from when the detection arrived (the navigator stamps it), as the
-                # simulator counts it; fall back to this tick if it is not stamped
-                t_det = det.get("t")
-                last_raw = dict(x_loc=round(float(det["x_loc"]), 3), y_loc=round(float(det["y_loc"]), 3),
-                                dist=round(float(det.get("dist", 0.0)), 3))
-                arrived = now if t_det is None else min(now, float(t_det))
-            ball = None
-            if last_det is not None:
-                ball = dict(last_det, age=round(now - arrived, 3))
             ox, oy, oyaw = float(get("odom_x")), float(get("odom_y")), float(get("odom_yaw"))
+            det = live_det(name)
+            key = None if det is None else (det.get("t_cap") or det.get("t") or id(det))
+            if det is not None and key != last_key:          # a new frame saw the ball
+                last_key = key
+                # the frame's own values (the navigator re-expresses x_loc/y_loc for
+                # the current pose and keeps these as x_cap/y_cap/dist_cap)
+                cap = dict(x_loc=float(det.get("x_cap", det["x_loc"])),
+                           y_loc=float(det.get("y_cap", det["y_loc"])), p25_dist=det.get("p25_dist"))
+                d_cap = det.get("dist_cap", det.get("dist"))
+                if d_cap is not None:
+                    cap["dist"] = float(d_cap)
+                c = ball_in_robot_frame(cap)                 # centre, robot frame at capture
+                pose_cap = det.get("pose_cap") or (ox, oy, oyaw)
+                ball_odom = local_to_odom((c["x_loc"], c["y_loc"]), pose_cap)   # fixed from now on
+                # age from when the frame was taken (t_cap), else when it arrived (t),
+                # else this tick
+                t_det = det.get("t_cap", det.get("t"))
+                arrived = now if t_det is None else min(now, float(t_det))
+                last_raw = dict(x_loc=round(cap["x_loc"], 3), y_loc=round(cap["y_loc"], 3),
+                                dist=round(float(cap.get("dist", 0.0)), 3), src=det.get("cap_src"),
+                                lag=(round(float(det["t"]) - float(det["t_cap"]), 3)
+                                     if det.get("t") is not None and det.get("t_cap") is not None else None))
+            ball = None
+            if ball_odom is not None:
+                lx, ly = odom_to_local(ball_odom, (ox, oy, oyaw))
+                ball = dict(x_loc=lx, y_loc=ly, dist=math.hypot(lx - CAM_X, ly), age=round(now - arrived, 3))
             t_od = get("odom_t") or now
             if prev_od is not None and t_od - prev_od[3] > 1e-3:        # a new odometry sample
                 dt_od = t_od - prev_od[3]
@@ -244,7 +262,9 @@ def run(path, get, set_, node, live_det, check, goal=None, max_time=90.0, name="
             belief = read_belief(policy, obs.t)
             set_(policy_belief=belief)
             logf.write(json.dumps(dict(t=round(t, 3), x=round(ox, 3), y=round(oy, 3), yaw=round(oyaw, 3),
-                                       ball=ball, raw=last_raw, bump=obs.bump, v=round(v, 3), w=round(w, 3),
+                                       ball=ball, raw=last_raw, bump=obs.bump,
+                                       ball_odom=(None if ball_odom is None
+                                                  else [round(ball_odom[0], 3), round(ball_odom[1], 3)]), v=round(v, 3), w=round(w, 3),
                                        v_meas=round(v_meas, 3), w_meas=round(w_meas, 3),
                                        scan=scan if scan is not None and scan_age < 0.05 else None,
                                        belief=belief, done=done)) + "\n")
@@ -260,10 +280,8 @@ def run(path, get, set_, node, live_det, check, goal=None, max_time=90.0, name="
                 still_since = None
             node().send_twist(v, w)
             v_sent, w_sent = v, w
-            if ball is not None:
-                bx = ox + ball["x_loc"] * math.cos(oyaw) - ball["y_loc"] * math.sin(oyaw)
-                by = oy + ball["x_loc"] * math.sin(oyaw) + ball["y_loc"] * math.cos(oyaw)
-                set_(ball_mark=(bx, by))
+            if ball_odom is not None:
+                set_(ball_mark=tuple(ball_odom))
             set_(status=f"policy {tag}: v={v:+.2f} w={w:+.2f}"
                         + (f" ball {ball['dist']:.2f} m (age {ball['age']:.1f}s)" if ball else " ball not seen"))
             sleep(max(0.0, TICK - (clock() - now)))
