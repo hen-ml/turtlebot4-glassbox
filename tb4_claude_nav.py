@@ -1004,7 +1004,8 @@ class NavNode(Node):
                 edge=_box_on_edge(x_px, y_px, w_px, h_px),   # cut off by the frame: biased
                 color=(_detect_color(frame, x_px, y_px, w_px, h_px) if label != 'person' else None),
             ))
-        capture_pose.place(dets, pose_cap, t_cap, cap_src)   # odom point per sighting, fixed from now on
+        capture_pose.place(dets, pose_cap, t_cap, cap_src,   # odom point per sighting, fixed from now on;
+                           cam_x=capture_pose.CAM_X)         # x_loc/y_loc are relative to the camera
         _set(detections=dets, cam_lag=round(arrival - t_cap, 3), cam_lag_src=cap_src)
 
     def _odom_cb(self, msg: Odometry):
