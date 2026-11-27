@@ -210,12 +210,14 @@ class FakeBase:
             bx, by = self.ball
             d = math.hypot(nx - bx, ny - by)
             if d < self.CONTACT and v > 0.0:
-                # contact push: clamp the robot at the ball and roll the ball by
-                # however far the robot actually travelled
+                # contact push: the ball gives way by however far the robot would
+                # have entered it, along the robot->ball line. (It used to clamp the
+                # robot at the ball and roll the ball by the CLAMPED robot's travel,
+                # which is ~0 in steady contact: the robot crawled at ~1/10 of the
+                # commanded speed and pushes finished or not depending on timing.)
                 ux, uy = (nx - bx) / d, (ny - by) / d
-                nx, ny = bx + ux * self.CONTACT, by + uy * self.CONTACT
-                step = math.hypot(nx - x, ny - y)
-                self.ball = [bx - ux * step, by - uy * step]
+                push = self.CONTACT - d
+                self.ball = [bx - ux * push, by - uy * push]
                 self.ball_track.append(tuple(self.ball))
             tb4._set(odom_x=nx, odom_y=ny, odom_yaw=yaw, odom_t=time.time())
             self._publish_ball()

@@ -192,7 +192,7 @@ def run(path, get, set_, node, live_det, check, goal=None, max_time=90.0, name="
                                cam_x=CAM_X, ball_r=BALL_R)) + "\n")
 
     t0 = clock()
-    ball_odom, last_key, last_raw, arrived = None, None, None, None
+    ball_odom, last_key, last_obj, last_raw, arrived = None, None, None, None, None
     v_sent = w_sent = 0.0
     v_meas = w_meas = 0.0
     prev_od = None
@@ -214,9 +214,11 @@ def run(path, get, set_, node, live_det, check, goal=None, max_time=90.0, name="
                 break
             ox, oy, oyaw = float(get("odom_x")), float(get("odom_y")), float(get("odom_yaw"))
             det = live_det(name)
-            key = None if det is None else (det.get("t_cap") or det.get("t") or id(det))
-            if det is not None and key != last_key:          # a new frame saw the ball
-                last_key = key
+            # a new frame saw the ball: a new capture time, or (unstamped detections)
+            # a new object; hold the last one so its identity cannot be reused
+            key = None if det is None else (det.get("t_cap") or det.get("t"))
+            if det is not None and (key != last_key if key is not None else det is not last_obj):
+                last_key, last_obj = key, det
                 # the frame's own values (the navigator re-expresses x_loc/y_loc for
                 # the current pose and keeps these as x_cap/y_cap/dist_cap)
                 cap = dict(x_loc=float(det.get("x_cap", det["x_loc"])),
