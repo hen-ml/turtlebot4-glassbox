@@ -1568,6 +1568,14 @@ class NavRobot:
                 if tc and d.get('color') != tc: continue      # colour-targeted command
                 if best is None or d.get('dist', 1e9) < best.get('dist', 1e9):
                     best = d
+        if best is not None and _get('goal_mode') == 'push' and 'x_cap' in best:
+            # Shoving: the ball moves WITH the robot between camera frames, so the
+            # sighting's fixed map point goes stale under the bumper and reads as
+            # "ball under the robot" (PUSH_TO_GOAL then re-lines-up forever: 1/10
+            # vs 6/10 layouts in the research repo's simulator). While pushing, use
+            # the frame's own robot-relative values, as before capture placement.
+            best = dict(best, x_loc=best['x_cap'], y_loc=best['y_cap'],
+                        dist=best.get('dist_cap', best.get('dist')))
         return best
 
     def _wall_goal(self, det):

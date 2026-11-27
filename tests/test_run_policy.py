@@ -196,6 +196,21 @@ class TestObservationMatchesTheSimulator(unittest.TestCase):
         self.assertEqual(beams[0], policy_runner.LIDAR_MAX)                    # behind: nothing
         self.assertEqual(sum(b < policy_runner.LIDAR_MAX for b in beams), 1)
 
+    def test_pushing_keeps_the_frame_relative_ball(self):
+        """A placed sighting stays put on the map (move mode), but while shoving the
+        ball travels with the robot, so _live_det keeps the frame's own values."""
+        import capture_pose
+        det = dict(label="sports ball", conf=0.9, x_loc=0.5, y_loc=0.0, dist=0.5)
+        capture_pose.place([det], (0.0, 0.0, 0.0), time.time(), "stamp")
+        with FakeBase((5.0, 5.0)):
+            tb4._set(detections=[det], odom_x=0.3, odom_y=0.0, odom_yaw=0.0, goal_mode="move")
+            d = tb4.NavRobot()._live_det("ball")
+            self.assertAlmostEqual(d["x_loc"], 0.2, places=3)       # static ball: 0.3 m closer now
+            tb4._set(goal_mode="push")
+            d = tb4.NavRobot()._live_det("ball")
+            self.assertAlmostEqual(d["x_loc"], 0.5, places=3)       # being pushed: moves with us
+            tb4._set(goal_mode="move", detections=[])
+
     def test_toyscript_verb(self):
         import toyscript
         out = []
