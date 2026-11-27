@@ -71,6 +71,14 @@ class PlaceAndReexpress(unittest.TestCase):
         self.assertEqual((d["x_cap"], d["y_cap"], d["dist_cap"]), (2.0, 0.0, 2.0))
         self.assertEqual(det["x_loc"], 2.0, "the stored detection must not change")
 
+    def test_camera_offset_is_added_when_placing(self):
+        # TurtleBot 4 Lite: the camera sits 3.7 cm BEHIND the base centre
+        self.assertAlmostEqual(CP.CAM_X, -0.037, places=3)
+        det = dict(label="sports ball", x_loc=1.0, y_loc=0.0, dist=1.0)
+        CP.place([det], (2.0, 0.0, math.pi), 0.0, "stamp", cam_x=CP.CAM_X)
+        self.assertAlmostEqual(det["odom"][0], 2.0 - 0.963, places=3)   # facing -x
+        self.assertAlmostEqual(det["odom"][1], 0.0, places=3)
+
     def test_unplaced_detections_pass_through_unchanged(self):
         det = dict(label="sports ball", x_loc=1.0, y_loc=0.0, dist=1.0)
         self.assertIs(CP.dets_now([det], (5.0, 5.0, 1.0))[0], det)

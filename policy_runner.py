@@ -45,6 +45,7 @@ import math
 import os
 import time
 
+import capture_pose
 from capture_pose import local_to_odom, odom_to_local
 from evo.policy_api import Obs, clamp_cmd, load_policy
 
@@ -55,8 +56,8 @@ HAZARD_FRESH = 0.08    # s: under one control step: "pressed during the last ste
                        # the Create 3 streams /hazard_detection while a bumper is pressed
 # Must match the simulator (sensing.cam_x, physics.ball_radius); set the measured
 # values on the robot with these environment variables.
-CAM_X = float(os.environ.get("TB4_CAM_X", "0.08"))    # m, camera ahead of the base centre
-BALL_R = float(os.environ.get("TB4_BALL_R", "0.11"))  # m, ball radius
+CAM_X = capture_pose.CAM_X                            # m, camera ahead of the base centre (TB4_CAM_X)
+BALL_R = float(os.environ.get("TB4_BALL_R", "0.11"))  # m, ball radius: set it for the ball in use
 
 
 LIDAR_BEAMS = 36           # must match the simulator (sensing.lidar_beams, lidar_max, lidar_min)

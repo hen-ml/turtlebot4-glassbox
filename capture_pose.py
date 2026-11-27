@@ -23,6 +23,11 @@ import os
 from collections import deque
 
 DEFAULT_LAG = float(os.environ.get("TB4_CAM_LAG", "0.35"))   # s, assumed capture->arrival delay
+# Camera (OAK-D Lite RGB) position ahead of base_link, from the TurtleBot 4 Lite
+# description (turtlebot4_description/urdf/lite: camera bracket at x -9.0 cm, the
+# OAK-D Lite +5.29 cm on it -> oakd_rgb_camera_frame at x -0.0371 m, i.e. BEHIND
+# the base centre; 18.6 cm above the floor). Override with TB4_CAM_X.
+CAM_X = float(os.environ.get("TB4_CAM_X", "-0.037"))
 MAX_LAG = 1.5             # s: a stamp further behind its arrival than this is not believed
 MAX_AHEAD = 0.05          # s: nor one ahead of it by more than clock jitter
 
@@ -93,15 +98,15 @@ class PoseHistory:
         return (x0 + f * (x1 - x0), y0 + f * (y1 - y0), _wrap(a0 + f * _wrap(a1 - a0)))
 
 
-def place(dets, pose_cap, t_cap, cap_src):
-    """Annotate detections (dicts with x_loc/y_loc in the robot frame at capture)
-    in place with where they were seen: t_cap, cap_src, pose_cap and `odom`, the
-    sighting's odom point. Returns dets."""
+def place(dets, pose_cap, t_cap, cap_src, cam_x=0.0):
+    """Annotate detections (dicts with x_loc/y_loc relative to the camera, which is
+    `cam_x` ahead of the base centre, at capture) in place with where they were
+    seen: t_cap, cap_src, pose_cap and `odom`, the sighting's odom point. Returns dets."""
     pc = [round(float(v), 4) for v in pose_cap]
     for d in dets:
         if d.get("x_loc") is None or d.get("y_loc") is None:
             continue
-        ox, oy = local_to_odom((d["x_loc"], d["y_loc"]), pose_cap)
+        ox, oy = local_to_odom((d["x_loc"] + cam_x, d["y_loc"]), pose_cap)
         d.update(t_cap=round(float(t_cap), 3), cap_src=cap_src, pose_cap=pc,
                  odom=[round(ox, 4), round(oy, 4)])
     return dets
