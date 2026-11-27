@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""Offline tests for RUN_POLICY (policy_runner + NavRobot.run_policy).
+
+Reuses the closed-loop FakeBase from test_push_to_goal (stubbed ROS, the real
+navigator module, a base that integrates cmd_vel and rolls the ball) and drives
+it with a small controller file written against evo.policy_api.
+
+Run:  python3 tests/test_run_policy.py
+"""
+import json
+import math
+import os
+import sys
+import tempfile
+import time
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+sys.path.insert(0, os.path.dirname(HERE))
+
+from test_push_to_goal import FakeBase, tb4          # noqa: E402  (stubs ROS on import)
+import policy_runner                                 # noqa: E402
+from evo.policy_api import PolicyRejected, check_source   # noqa: E402
+
+POLICY = os.path.join(HERE, "fixtures", "simple_push_policy.py")
+
+
+class TestPolicyCheck(unittest.TestCase):
+    def test_rejects_file_system_access(self):
+        with self.assertRaises(PolicyRejected):
+            check_source("import os\ndef make_policy():\n    return None\n")
+        with self.assertRaises(PolicyRejected):
+            check_source("class Policy:\n    def act(self, o):\n        return open('x')\n")
+
+    def test_accepts_the_fixture(self):
+        with open(POLICY) as f:
+            check_source(f.read())
+
+
+class TestRunPolicy(unittest.TestCase):
+    def setUp(self):
+        self.logdir = tempfile.mkdtemp()
+        policy_runner.LOG_DIR = self.logdir
+        # FakeBase publishes the ball centre relative to the base, so no camera
+        # offset or radius to add in this world.
+        self._saved = (policy_runner.CAM_X, policy_runner.BALL_R)
+        policy_runner.CAM_X, policy_runner.BALL_R = 0.0, 0.0
+
+    def tearDown(self):
+        policy_runner.CAM_X, policy_runner.BALL_R = self._saved
+
+    def _run(self, ball, goal, max_time=60.0):
+        tb4._set(ball_goal=goal)
+        with FakeBase(ball) as base:
+            r = policy_runner.run(POLICY, get=tb4._get, set_=tb4._set, node=lambda: tb4.ros_node,
+                                  live_det=tb4.NavRobot()._live_det, check=lambda: None,
+                                  max_time=max_time, log_dir=self.logdir)
+            return r, base
+
+    def test_pushes_the_ball_toward_the_goal(self):
+        goal = (2.6, 0.4)
+        r, base = self._run(ball=(1.0, 0.2), goal=goal)
+        d0 = math.hypot(1.0 - goal[0], 0.2 - goal[1])
+        self.assertIn(r, ("done", "settled", "timeout"))
+        self.assertLess(base.ball_dist_to(goal), d0 - 0.5, f"ball barely moved ({r})")
+
+    def test_no_goal(self):
+        tb4._set(ball_goal=None)
+        with FakeBase((1.0, 0.0)):
+            r = policy_runner.run(POLICY, get=tb4._get, set_=tb4._set, node=lambda: tb4.ros_node,
+                                  live_det=tb4.NavRobot()._live_det, check=lambda: None,
+                                  log_dir=self.logdir)
+        self.assertEqual(r, "no-goal")
+
+    def test_logs_every_tick_and_stops_the_base(self):
+        r, base = self._run(ball=(1.0, 0.0), goal=(2.0, 0.0), max_time=3.0)
+        files = os.listdir(self.logdir)
+        self.assertEqual(len(files), 1)
+        with open(os.path.join(self.logdir, files[0])) as f:
+            lines = [json.loads(x) for x in f]
+        self.assertEqual(lines[0]["kind"], "start")
+        self.assertEqual(lines[-1]["kind"], "end")
+        self.assertGreater(len(lines), 10)
+        self.assertEqual(base.twists[-1], (0.0, 0.0))
+
+    def test_bad_policy_never_moves_the_robot(self):
+        bad = os.path.join(self.logdir, "bad.py")
+        with open(bad, "w") as f:
+            f.write("import subprocess\ndef make_policy():\n    return None\n")
+        tb4._set(ball_goal=(2.0, 0.0))
+        with FakeBase((1.0, 0.0)) as base:
+            r = policy_runner.run(bad, get=tb4._get, set_=tb4._set, node=lambda: tb4.ros_node,
+                                  live_det=tb4.NavRobot()._live_det, check=lambda: None,
+                                  log_dir=self.logdir)
+        self.assertTrue(r.startswith("error"))
+        self.assertEqual(base.twists, [])
+
+    def test_navrobot_method_resolves_relative_paths(self):
+        tb4._set(ball_goal=(2.0, 0.0))
+        rel = os.path.relpath(POLICY, os.path.dirname(HERE))
+        with FakeBase((1.0, 0.0)):
+            t0 = time.time()
+            r = tb4.NavRobot().run_policy(rel, max_time=2.0)
+        self.assertIn(r, ("done", "settled", "timeout"))
+        self.assertLess(time.time() - t0, 10)
+
+
+def _write_policy(dirname, body):
+    path = os.path.join(dirname, "p.py")
+    with open(path, "w") as f:
+        f.write("class Policy:\n    def reset(self, goal):\n        self.goal = goal\n"
+                "    def act(self, obs):\n" + body)
+    return path
+
+
+class TestObservationMatchesTheSimulator(unittest.TestCase):
+    """The robot must hand the policy what the simulator does (evo.policy_api)."""
+
+    def setUp(self):
+        self.logdir = tempfile.mkdtemp()
+
+    def _log(self):
+        f = [x for x in os.listdir(self.logdir) if x.endswith(".jsonl")][-1]
+        with open(os.path.join(self.logdir, f)) as fh:
+            return [json.loads(x) for x in fh]
+
+    def _run(self, policy, ball=(3.0, 3.0), goal=(2.0, 0.0), state=None, **kw):
+        tb4._set(ball_goal=goal)
+        with FakeBase(ball) as base:
+            if state:
+                tb4._set(**state)                 # after FakeBase, which resets the world
+            r = policy_runner.run(policy, get=tb4._get, set_=tb4._set, node=lambda: tb4.ros_node,
+                                  live_det=tb4.NavRobot()._live_det, check=lambda: None,
+                                  log_dir=self.logdir, **kw)
+        return r, base
+
+    def test_ball_is_its_centre_in_the_robot_frame(self):
+        b = policy_runner.ball_in_robot_frame
+        # p25 depth (axial) 1.0 m straight ahead -> centre 1.0 + r ahead of the lens
+        d = b(dict(x_loc=1.0, y_loc=0.0, dist=1.0, p25_dist=1.0), cam_x=0.08, ball_r=0.11)
+        self.assertAlmostEqual(d["x_loc"], 0.08 + 1.11, places=6)
+        self.assertAlmostEqual(d["dist"], 1.11, places=6)
+        # p25 depth at 30 deg is axial: range = 1 / cos 30
+        a = math.radians(30)
+        d = b(dict(x_loc=math.cos(a), y_loc=math.sin(a), dist=1.0, p25_dist=1.0), cam_x=0.0, ball_r=0.0)
+        self.assertAlmostEqual(d["dist"], 1.0 / math.cos(a), places=6)
+        # raw OAK spatial distance is already a range
+        d = b(dict(x_loc=math.cos(a), y_loc=math.sin(a), dist=1.0, p25_dist=None), cam_x=0.0, ball_r=0.1)
+        self.assertAlmostEqual(d["dist"], 1.1, places=6)
+        self.assertAlmostEqual(math.atan2(d["y_loc"], d["x_loc"]), a, places=6)
+
+    def test_bump_is_only_a_fresh_hazard(self):
+        pol = _write_policy(self.logdir, "        return (0.0, 0.0, bool(obs.bump))\n")
+        bump = [{"type": "bump", "where": "front"}]
+        r, _ = self._run(pol, max_time=4.0, state=dict(hazards=bump, last_hazard_t=time.time() - 1.5))
+        self.assertEqual(r, "settled", "a 1.5 s old bump must not count")
+        r, _ = self._run(pol, max_time=4.0, state=dict(hazards=bump, last_hazard_t=time.time() + 60))
+        self.assertEqual(r, "done", "a fresh bump must count")
+        tb4._set(hazards=[], last_hazard_t=0.0)
+
+    def test_v_and_w_are_measured_from_odometry(self):
+        pol = _write_policy(self.logdir, "        return (0.2, 0.5, obs.t > 2.0)\n")
+        r, _ = self._run(pol, max_time=5.0)
+        ticks = [x for x in self._log() if "v_meas" in x and x["t"] > 1.0]
+        self.assertTrue(ticks)
+        self.assertAlmostEqual(sum(x["v_meas"] for x in ticks) / len(ticks), 0.2, delta=0.04)
+        self.assertAlmostEqual(sum(x["w_meas"] for x in ticks) / len(ticks), 0.5, delta=0.08)
+
+    def test_goal_relative_to_the_start_pose(self):
+        pol = _write_policy(self.logdir, "        return (0.0, 0.0, True)\n")
+        tb4._set(ball_goal=None)
+        with FakeBase((3.0, 3.0), pose=(1.0, 2.0, math.pi / 2)):
+            policy_runner.run(pol, get=tb4._get, set_=tb4._set, node=lambda: tb4.ros_node,
+                              live_det=tb4.NavRobot()._live_det, check=lambda: None,
+                              log_dir=self.logdir, goal_rel=(1.0, 0.5))
+        g = self._log()[0]["goal"]
+        self.assertAlmostEqual(g[0], 1.0 - 0.5, places=3)
+        self.assertAlmostEqual(g[1], 2.0 + 1.0, places=3)
+
+    def test_lidar_beams_in_the_robot_frame(self):
+        """A wall 1 m straight ahead of the robot, in the RPLIDAR's own frame (mounted
+        yaw +90 deg), must come out as the forward beam; nothing elsewhere = max."""
+        class Scan:
+            pass
+        sc = Scan()
+        sc.angle_min, sc.angle_increment, sc.range_min = -math.pi, math.radians(1.0), 0.15
+        sc.ranges = [float("inf")] * 360
+        fwd_lidar = math.atan2(-math.cos(0.0), math.sin(0.0))        # base bearing 0 in lidar angles
+        k = int(round((fwd_lidar - sc.angle_min) / sc.angle_increment)) % 360
+        for j in (k - 1, k, k + 1):
+            sc.ranges[j % 360] = 1.0
+        beams = policy_runner.scan_beams(sc)
+        self.assertEqual(len(beams), policy_runner.LIDAR_BEAMS)
+        self.assertAlmostEqual(beams[policy_runner.LIDAR_BEAMS // 2], 1.0)   # straight ahead
+        self.assertEqual(beams[0], policy_runner.LIDAR_MAX)                    # behind: nothing
+        self.assertEqual(sum(b < policy_runner.LIDAR_MAX for b in beams), 1)
+
+    def test_pushing_keeps_the_frame_relative_ball(self):
+        """A placed sighting stays put on the map (move mode), but while shoving the
+        ball travels with the robot, so _live_det keeps the frame's own values."""
+        import capture_pose
+        det = dict(label="sports ball", conf=0.9, x_loc=0.5, y_loc=0.0, dist=0.5)
+        capture_pose.place([det], (0.0, 0.0, 0.0), time.time(), "stamp")
+        with FakeBase((5.0, 5.0)):
+            tb4._set(detections=[det], odom_x=0.3, odom_y=0.0, odom_yaw=0.0, goal_mode="move")
+            d = tb4.NavRobot()._live_det("ball")
+            self.assertAlmostEqual(d["x_loc"], 0.2, places=3)       # static ball: 0.3 m closer now
+            tb4._set(goal_mode="push")
+            d = tb4.NavRobot()._live_det("ball")
+            self.assertAlmostEqual(d["x_loc"], 0.5, places=3)       # being pushed: moves with us
+            tb4._set(goal_mode="move", detections=[])
+
+    def test_every_unstamped_detection_is_a_new_frame(self):
+        """Detections without t/t_cap (test worlds) are new frames by object, not by
+        id(): a recycled id must not make a fresh detection look stale."""
+        pol = _write_policy(self.logdir, "        return (0.0, 0.0, obs.t > 1.0)\n")
+        frames = iter(range(10**6))
+
+        def live_det(name):                      # a NEW dict every tick, like FakeBase
+            next(frames)
+            return dict(label="sports ball", x_loc=1.0, y_loc=0.0, dist=1.0)
+        tb4._set(ball_goal=(2.0, 0.0))
+        with FakeBase((3.0, 3.0)):
+            policy_runner.run(pol, get=tb4._get, set_=tb4._set, node=lambda: tb4.ros_node,
+                              live_det=live_det, check=lambda: None, log_dir=self.logdir)
+        ages = [x["ball"]["age"] for x in self._log() if x.get("ball")]
+        self.assertTrue(ages and max(ages) < 0.05, ages[:20])
+
+    def test_toyscript_verb(self):
+        import toyscript
+        out = []
+        it = toyscript.Interpreter(toyscript.MockRobot(log=out.append), log=out.append)
+        it.run('SET r = RUN_POLICY_REL("policies/current.py", 1.5, -0.25)\n')
+        self.assertEqual(it.env["r"], "done")
+        self.assertTrue(any("RUN_POLICY_REL" in x and "fwd=1.50" in x for x in out), out)
+        it.run('SET b = PUSH_TO_GOAL_REL(1.5, -0.25)\n')
+        self.assertEqual(it.env["b"], "at goal")
+
+    def test_baseline_goal_relative_to_the_start_pose(self):
+        got = {}
+        nav = tb4.NavRobot()
+        nav.push_to_goal = lambda gx, gy, max_time=None: got.update(g=(gx, gy), t=max_time) or "at goal"
+        with FakeBase((3.0, 3.0), pose=(1.0, 2.0, math.pi / 2)):
+            r = nav.push_to_goal_rel(1.0, 0.5)
+        self.assertEqual(r, "at goal")
+        self.assertAlmostEqual(got["g"][0], 0.5, places=3)
+        self.assertAlmostEqual(got["g"][1], 3.0, places=3)
+        self.assertEqual(got["t"], 90.0)
+
+
+class TestPolicyBelief(unittest.TestCase):
+    """The controller's optional self-report: logged every tick, shown on the map
+    while it runs, cleared after, and never able to break a run."""
+
+    def setUp(self):
+        self.logdir = tempfile.mkdtemp()
+        self._saved = (policy_runner.CAM_X, policy_runner.BALL_R)
+        policy_runner.CAM_X, policy_runner.BALL_R = 0.0, 0.0
+
+    def tearDown(self):
+        policy_runner.CAM_X, policy_runner.BALL_R = self._saved
+        tb4._set(policy_belief=None)
+
+    def _ticks(self):
+        f = [x for x in os.listdir(self.logdir) if x.endswith(".jsonl")]
+        self.assertEqual(len(f), 1)
+        with open(os.path.join(self.logdir, f[0])) as fh:
+            return [x for x in map(json.loads, fh) if "kind" not in x]
+
+    def _run(self, policy, ball=(3.0, 3.0), goal=(2.0, 0.0), set_=None, max_time=4.0):
+        tb4._set(ball_goal=goal)
+        with FakeBase(ball) as base:
+            r = policy_runner.run(policy, get=tb4._get, set_=set_ or tb4._set,
+                                  node=lambda: tb4.ros_node, live_det=tb4.NavRobot()._live_det,
+                                  check=lambda: None, log_dir=self.logdir, max_time=max_time)
+        return r, base
+
+    def test_logged_shown_and_cleared(self):
+        pol = _write_policy(self.logdir,
+                            "        self.belief = dict(ball=(1.5, -0.5), ball_t=0.0, mode='probe')\n"
+                            "        return (0.0, 0.0, obs.t > 1.0)\n")
+        shown = []
+
+        def spy(**kw):
+            if "policy_belief" in kw:
+                shown.append(kw["policy_belief"])
+            tb4._set(**kw)
+        r, _ = self._run(pol, set_=spy)
+        self.assertEqual(r, "done")
+        ticks = self._ticks()
+        self.assertTrue(ticks)
+        for x in ticks:
+            self.assertEqual(x["belief"]["ball"], [1.5, -0.5])
+            self.assertEqual(x["belief"]["mode"], "probe")
+            self.assertAlmostEqual(x["belief"]["age"], x["t"], delta=0.01)   # ball_t = 0
+        self.assertIn({"ball": [1.5, -0.5], "age": 0.0, "mode": "probe"}, shown)
+        self.assertIsNone(shown[-1], "the map must not keep a finished run's belief")
+        self.assertIsNone(tb4._get("policy_belief"))
+
+    def test_malformed_belief_never_stops_a_run(self):
+        pol = _write_policy(self.logdir,
+                            "        self.belief = dict(ball=('a', 'b')) if obs.t < 0.5 else 'nonsense'\n"
+                            "        return (0.0, 0.0, obs.t > 1.0)\n")
+        r, _ = self._run(pol)
+        self.assertEqual(r, "done")
+        self.assertTrue(all(x["belief"] is None for x in self._ticks()))
+
+    def test_read_belief(self):
+        rb = policy_runner.read_belief
+
+        class Method:
+            def belief(self):
+                return {"ball": (1, 2), "ball_t": 1.0, "mode": "push"}
+
+        class NoBelief:
+            pass
+
+        class NaN:
+            belief = {"ball": (float("nan"), 0.0), "mode": "x"}
+
+        class Raises:
+            @property
+            def belief(self):
+                raise RuntimeError("boom")
+        self.assertEqual(rb(Method(), 3.5), {"ball": [1.0, 2.0], "age": 2.5, "mode": "push"})
+        self.assertIsNone(rb(NoBelief(), 1.0))
+        self.assertEqual(rb(NaN(), 1.0), {"mode": "x"})
+        self.assertIsNone(rb(Raises(), 1.0))
+
+    def test_fixture_reports_where_it_saw_the_ball(self):
+        self._run(POLICY, ball=(1.0, 0.2), goal=(2.6, 0.4), max_time=6.0)
+        beliefs = [x["belief"] for x in self._ticks() if x["belief"]]
+        self.assertTrue(beliefs)
+        self.assertLessEqual({b["mode"] for b in beliefs}, {"search", "approach", "push"})
+        first = next(b for b in beliefs if b.get("ball"))
+        self.assertLess(math.hypot(first["ball"][0] - 1.0, first["ball"][1] - 0.2), 0.3)
+
+    def test_map_marker_and_state(self):
+        self.assertEqual(tb4.belief_label({"ball": [1, 2], "mode": "push", "age": 3.21}),
+                         "BELIEF push 3.2s")
+        self.assertIsNone(tb4.belief_label({"mode": "search"}))      # no ball: nothing to draw
+        self.assertIsNone(tb4.belief_label(None))
+        import cv2
+        import numpy as np
+        plain = tb4.render_lidar_png(None, [], None)
+        marked = tb4.render_lidar_png(None, [], None, belief_local=(1.0, 0.0), belief_label="BELIEF")
+        a, b = (cv2.imdecode(np.frombuffer(p, np.uint8), cv2.IMREAD_COLOR) for p in (plain, marked))
+        self.assertGreater(int((a != b).any(axis=2).sum()), 50)
+        tb4._set(policy_belief={"ball": [1.0, 2.0], "mode": "push"})
+        with tb4.app.test_client() as c:
+            self.assertEqual(c.get("/state").get_json()["policy_belief"],
+                             {"ball": [1.0, 2.0], "mode": "push"})
+
+
+class TestCameraIntrinsics(unittest.TestCase):
+    def test_preview_is_the_centre_crop_of_the_720p_frame(self):
+        """The 416 preview is the centre 720x720 of the 1280x720 frame (fx 1002.91,
+        cx 653.62), not the whole width squashed: ~39.5 deg across, not 65."""
+        self.assertAlmostEqual(tb4.CAM_FX, 1002.91 * 416 / 720, delta=0.5)
+        self.assertAlmostEqual(tb4.CAM_CX, (653.62 - 280) * 416 / 720, delta=0.5)
+        hfov = 2 * math.degrees(math.atan(208 / tb4.CAM_FX))
+        self.assertAlmostEqual(hfov, 39.5, delta=0.3)
+
+
+class TestEdgeBoxes(unittest.TestCase):
+    """A ball cut off by the frame edge gives a biased bearing and range (on the robot:
+    1.38 m instead of 1.0 m, and PUSH_TO_GOAL declared 'at goal' from it)."""
+
+    def test_box_on_edge(self):
+        e = tb4._box_on_edge
+        self.assertTrue(e(391, 260, 48, 106))        # the false 'at goal' sighting, 2026-11-26
+        self.assertTrue(e(27, 284, 54, 63))          # half out on the left
+        self.assertTrue(e(208, 390, 60, 60))         # cut off at the bottom (close ball)
+        self.assertFalse(e(299, 260, 48, 48))        # the same ball, whole, a moment later
+        self.assertFalse(e(208, 208, 24, 24))
+
+    def _det(self, label, edge, x=1.0):
+        return dict(label=label, conf=0.9, x_loc=x, y_loc=0.0, dist=x, edge=edge)
+
+    def test_ball_skills_wait_for_a_whole_view(self):
+        with FakeBase((5.0, 5.0)):
+            nav = tb4.NavRobot()
+            tb4._set(detections=[self._det("sports ball", True)], goal_mode="move")
+            self.assertIsNone(nav._live_det("ball"))
+            tb4._set(detections=[self._det("sports ball", True, 0.5), self._det("sports ball", False, 1.5)])
+            self.assertAlmostEqual(nav._live_det("ball")["x_loc"], 1.5)   # the whole one, though farther
+            tb4._set(detections=[self._det("sports ball", True)], goal_mode="push")
+            self.assertIsNotNone(nav._live_det("ball"), "while shoving the ball is always cut off")
+            tb4._set(detections=[self._det("person", True)], goal_mode="move")
+            self.assertIsNotNone(nav._live_det("person"), "people near the robot are always cut off")
+            tb4._set(detections=[], goal_mode="move")
+
+    def test_run_policy_never_hands_the_controller_an_edge_box(self):
+        d = tempfile.mkdtemp()
+        pol = _write_policy(d, "        return (0.0, 0.0, obs.t > 1.0)\n")
+        logs = tempfile.mkdtemp()
+        with FakeBase((5.0, 5.0)):
+            tb4._set(ball_goal=(2.0, 0.0))
+            policy_runner.run(pol, get=tb4._get, set_=tb4._set, node=lambda: tb4.ros_node,
+                              live_det=lambda name: dict(label="sports ball", x_loc=1.0, y_loc=0.0,
+                                                         dist=1.0, t=time.time(), edge=True),
+                              check=lambda: None, log_dir=logs, max_time=3.0)
+        with open(os.path.join(logs, os.listdir(logs)[0])) as f:
+            ticks = [json.loads(line) for line in f if '"kind"' not in line]
+        self.assertTrue(ticks)
+        self.assertTrue(all(t["ball"] is None for t in ticks), "an edge box reached the controller")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

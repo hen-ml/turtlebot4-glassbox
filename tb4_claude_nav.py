@@ -21,6 +21,7 @@ Usage:
 import os, json, math, time, threading, heapq, re, glob, subprocess
 import numpy as np
 import toyscript
+import capture_pose
 import cv2
 import rclpy
 from rclpy.node import Node
@@ -132,8 +133,29 @@ HAZARD_STOP   = {1, 2, 4}        # bump, cliff, wheel_drop → halt navigation
 NN_TOPIC      = "/oakd/nn/spatial_detections"     # on-camera YOLO spatial (OAK-D VPU)
 DET_CONF_MIN  = 0.3       # drop detections below this confidence (cut false positives)
 CAM_TOPIC     = "/oakd/rgb/preview/image_raw"      # OAK-D RGB preview
-CAM_FX        = 325.95    # OAK-D 416 preview intrinsics (from camera_info)
-CAM_CX        = 212.43
+# OAK-D 416 preview intrinsics. The preview is the CENTRE 720x720 square of the
+# 1280x720 RGB frame resized to 416 (keep-aspect crop; the stereo depth is aligned
+# to the same 1280x720 frame, which is why _p25_depth uses centre-square geometry).
+# From /oakd/rgb/camera_info (fx 1002.91, cx 653.62): fx = 1002.91*416/720,
+# cx = (653.62 - 280)*416/720. /oakd/rgb/preview/camera_info reports fx 325.95: it
+# scales the full WIDTH (1280 -> 416) as if the frame were squashed, which made the
+# preview look 65 deg wide instead of 39.5 and overstated every off-centre bearing
+# up to ~1.7x, so a static object swung across the map as it moved in the image.
+# Measured on the robot 2026-11-26: pairs of sightings of a static object taken while
+# turning in place agree best at fx 565-580; the ball's scatter fell 7.2 -> 2.1 cm.
+CAM_FX        = 579.45
+CAM_CX        = 215.86
+PREVIEW_PX    = 416       # the square preview YOLO runs on
+EDGE_PX       = 3         # a box within this many px of the preview border is cut off by the frame
+
+
+def _box_on_edge(x_px, y_px, w_px, h_px, size=PREVIEW_PX, margin=EDGE_PX):
+    """True if a detection box touches the preview border. The object is cut off,
+    so the box centre (bearing) and the depth over the box (range) are biased:
+    on the robot 2026-11-26 a ball half out of frame read 1.38 m instead of 1.0 m
+    and PUSH_TO_GOAL declared 'at goal' from it."""
+    return (x_px - w_px / 2.0 <= margin or x_px + w_px / 2.0 >= size - margin or
+            y_px - h_px / 2.0 <= margin or y_px + h_px / 2.0 >= size - margin)
 DEPTH_TOPIC   = "/oakd/stereo/image_raw"   # raw stereo depth (16UC1 mm) for p25 distance
 IMG_REFRESH_HZ = 2.0       # 2 fps
 # ─────────────────────────────────────────────────────────────────────────────
@@ -203,7 +225,10 @@ _state = {
     # Ball-push task (PUSH_TO_GOAL) — the goal is for the BALL, not the robot
     "ball_goal":          None,   # human-set odom (x, y) the ball should be pushed to
     "ball_mark":          None,   # last known ball position (odom x, y)
+    "cam_lag":            None,   # s, camera frame capture -> detection arrival (last frame)
+    "cam_lag_src":        None,   # 'stamp' (from the message) or 'assumed' (TB4_CAM_LAG)
     "push_from":          None,   # stance point on the goal↔ball line (odom x, y)
+    "policy_belief":      None,   # RUN_POLICY controller's self-report {ball:[x,y] odom, age, mode}
     # Dataset recording (UI-controlled)
     "recording":          False,
     "record_drive":       "",     # current drive dir name
@@ -231,6 +256,22 @@ def _wrap_angle(a):
     """Angle (rad) wrapped to (-pi, pi]."""
     return (a + math.pi) % (2 * math.pi) - math.pi
 
+
+# Odometry history, so each camera sighting is placed with the pose the robot had
+# when the frame was taken (capture_pose.py), not the pose when it arrived.
+_pose_hist = capture_pose.PoseHistory()
+_scan_hist = capture_pose.Stamped(16)       # ~2 s of 8 Hz scans, to range a detection at its capture
+
+def _dets_now_unlocked():
+    """_state['detections'] as seen from the robot's pose now (caller holds _lock):
+    each sighting's x_loc/y_loc re-expressed from where it was placed on the map,
+    so a static object stays put while the robot moves between camera frames."""
+    return capture_pose.dets_now(_state['detections'],
+                                 (_state['odom_x'], _state['odom_y'], _state['odom_yaw']))
+
+def _dets_now():
+    with _lock:
+        return _dets_now_unlocked()
 
 def _odom_to_local(pt, ox, oy, oyaw):
     """odom point -> robot/base_link frame (x=forward, y=left). The inverse of
@@ -423,8 +464,22 @@ def smooth_path(grid: np.ndarray, path: list) -> list:
 
 
 # ── Lidar visualisation ───────────────────────────────────────────────────────
+def belief_label(pb):
+    """BEV caption for a RUN_POLICY belief: 'BELIEF push 3.2s' (mode and age only
+    when the policy reported them). None when there is no belief to draw."""
+    if not pb or not pb.get('ball'):
+        return None
+    parts = ['BELIEF']
+    if pb.get('mode'):
+        parts.append(str(pb['mode']))
+    if pb.get('age') is not None:
+        parts.append(f"{float(pb['age']):.1f}s")
+    return ' '.join(parts)
+
+
 def render_lidar_png(scan, path, goal_local, detections=None, look_local=None, goal_mode='move',
-                     ball_goal_local=None, ball_local=None, push_from_local=None) -> bytes:
+                     ball_goal_local=None, ball_local=None, push_from_local=None,
+                     belief_local=None, belief_label=None) -> bytes:
     img   = np.full((VIZ_SIZE, VIZ_SIZE, 3), (18,18,18), dtype=np.uint8)
     cx = cy = VIZ_SIZE // 2
     scale   = VIZ_SIZE / (GRID_CELLS * GRID_RES)
@@ -510,6 +565,21 @@ def render_lidar_png(scan, path, goal_local, detections=None, look_local=None, g
         cv2.circle(img, sp, 7, (230, 230, 230), 1)
         cv2.putText(img, "STANCE", (sp[0]+10, sp[1]-8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.34, (200, 200, 200), 1, cv2.LINE_AA)
+    # RUN_POLICY: where the CONTROLLER says the ball is (its own estimate, which
+    # can be stale). Hollow ring + cross so it reads as a belief, not a sensor
+    # reading; a dotted line to BALL (the latest detection) shows the gap.
+    if belief_local:
+        pp, col = w2p(*belief_local), (255, 255, 120)          # pale cyan
+        if ball_local:
+            bp = w2p(*ball_local)
+            for i in range(0, 16, 2):
+                t0, t1 = i / 16.0, (i + 1) / 16.0
+                cv2.line(img, (int(pp[0] + (bp[0]-pp[0])*t0), int(pp[1] + (bp[1]-pp[1])*t0)),
+                              (int(pp[0] + (bp[0]-pp[0])*t1), int(pp[1] + (bp[1]-pp[1])*t1)), col, 1)
+        cv2.circle(img, pp, 11, col, 2)
+        cv2.drawMarker(img, pp, col, cv2.MARKER_CROSS, 14, 1)
+        cv2.putText(img, belief_label or "BELIEF", (pp[0]+13, pp[1]-8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, col, 1, cv2.LINE_AA)
 
     cv2.circle(img, (cx,cy), 8, (30,100,255), -1)
     cv2.arrowedLine(img, (cx,cy), (cx,cy-22), (200,200,255), 2, tipLength=0.4)
@@ -775,6 +845,7 @@ class NavNode(Node):
                              durability=DurabilityPolicy.VOLATILE,
                              history=HistoryPolicy.KEEP_LAST, depth=5)
         self._depth = None
+        self._depth_hist = capture_pose.Stamped(6)   # ~3 s of 2 fps depth, matched to detections by stamp
         self.create_subscription(LaserScan,        '/scan',                       self._scan_cb,  qos_s)
         self.create_subscription(Image,            CAM_TOPIC,                     self._img_cb,   qos_cam)
         self.create_subscription(Image,            DEPTH_TOPIC,                   self._depth_cb, qos_cam)
@@ -819,17 +890,21 @@ class NavNode(Node):
             return False
 
     def _scan_cb(self, msg: LaserScan):
+        _scan_hist.add(capture_pose.msg_time(msg, time.time()), msg)
         with _lock:
             _state['scan']      = msg
             _state['scan_t']    = time.time()
             _ox, _oy, _oyaw = _state['odom_x'], _state['odom_y'], _state['odom_yaw']
             _loc = lambda pt: (_odom_to_local(pt, _ox, _oy, _oyaw) if pt else None)
+            _pb = _state['policy_belief'] or {}
             _state['lidar_png'] = render_lidar_png(
-                msg, _state['path'], _state['goal_local'], _state['detections'],
+                msg, _state['path'], _state['goal_local'], _dets_now_unlocked(),
                 _state['look_local'], _state['goal_mode'],
                 ball_goal_local=_loc(_state['ball_goal']),
                 ball_local=_loc(_state['ball_mark']),
-                push_from_local=_loc(_state['push_from']))
+                push_from_local=_loc(_state['push_from']),
+                belief_local=_loc(_pb.get('ball')),
+                belief_label=belief_label(_pb))
 
     def _img_cb(self, msg: Image):
         try:
@@ -844,13 +919,20 @@ class NavNode(Node):
         try:
             if '16' in msg.encoding:
                 self._depth = np.frombuffer(bytes(msg.data), np.uint16).reshape(msg.height, msg.width)
+                self._depth_hist.add(capture_pose.msg_time(msg, time.time()), self._depth)
         except Exception:
             pass
 
-    def _p25_depth(self, x_px, y_px, w_px, h_px):
+    def _p25_depth(self, x_px, y_px, w_px, h_px, t=None):
         """p25 of stereo depth (m) over the box; maps 416 preview -> depth via
-        center-square-crop geometry. None if no depth/too few valid pixels."""
+        center-square-crop geometry. None if no depth/too few valid pixels.
+        With `t` (the detection's capture time) it reads the depth frame from
+        that moment, not the newest one, which looks elsewhere while turning."""
         d = self._depth
+        if t is not None:
+            dt = self._depth_hist.nearest(t)[1]
+            if dt is not None:
+                d = dt
         if d is None:
             return None
         H, W = d.shape
@@ -870,6 +952,11 @@ class NavNode(Node):
         comes from p25 of the stereo depth over the box (see _p25_depth)."""
         dets = []
         frame = _get('frame_rgb')
+        arrival = time.time()
+        st = getattr(getattr(msg, 'header', None), 'stamp', None)
+        stamp = (st.sec + st.nanosec * 1e-9) if st is not None and hasattr(st, 'sec') else None
+        t_cap, cap_src = capture_pose.capture_time(stamp, arrival)
+        pose_cap = _pose_hist.at(t_cap) or (_get('odom_x'), _get('odom_y'), _get('odom_yaw'))
         for det in msg.detections:
             if not det.results:
                 continue
@@ -889,8 +976,9 @@ class NavNode(Node):
             bc, bs = det.bbox.center.position, det.bbox.size
             x_px=float(bc.x); y_px=float(bc.y); w_px=float(bs.x); h_px=float(bs.y)
             bearing = -math.atan((x_px - CAM_CX) / CAM_FX)   # real preview intrinsics
-            ld = _lidar_range_at_bearing(_get("scan"), bearing)
-            p25 = self._p25_depth(x_px, y_px, w_px, h_px)
+            sc = _scan_hist.nearest(t_cap)[1]
+            ld = _lidar_range_at_bearing(sc if sc is not None else _get("scan"), bearing)
+            p25 = self._p25_depth(x_px, y_px, w_px, h_px, t=t_cap)
             if _get("use_lidar_dist"):
                 # p25 of stereo depth over the box (correct box->depth align) reads
                 # the ball true even when the spatial NN reports the wall behind it.
@@ -904,6 +992,7 @@ class NavNode(Node):
             else:
                 x_loc, y_loc, dist = cam_x, cam_y, cam_dist   # raw OAK stereo
             dets.append(dict(
+                t=arrival,                           # arrival; t_cap (below) = when the frame was taken
                 label=label,
                 conf=float(hyp.score),
                 x_loc=x_loc, y_loc=y_loc,
@@ -912,14 +1001,17 @@ class NavNode(Node):
                 p25_dist=(float(p25) if p25 is not None else None),
                 x_px=float(bc.x), y_px=float(bc.y),
                 w_px=float(bs.x), h_px=float(bs.y),
+                edge=_box_on_edge(x_px, y_px, w_px, h_px),   # cut off by the frame: biased
                 color=(_detect_color(frame, x_px, y_px, w_px, h_px) if label != 'person' else None),
             ))
-        _set(detections=dets)
+        capture_pose.place(dets, pose_cap, t_cap, cap_src)   # odom point per sighting, fixed from now on
+        _set(detections=dets, cam_lag=round(arrival - t_cap, 3), cam_lag_src=cap_src)
 
     def _odom_cb(self, msg: Odometry):
         p = msg.pose.pose
-        _set(odom_x=p.position.x, odom_y=p.position.y,
-             odom_yaw=_quat_to_yaw(p.orientation), odom_t=time.time())
+        now, yaw = time.time(), _quat_to_yaw(p.orientation)
+        _pose_hist.add(now, p.position.x, p.position.y, yaw)
+        _set(odom_x=p.position.x, odom_y=p.position.y, odom_yaw=yaw, odom_t=now)
 
     def _battery_cb(self, msg: BatteryState):
         _set(battery_voltage=float(msg.voltage),
@@ -1021,7 +1113,7 @@ def find_target(description: str) -> tuple:
       2. YOLO keyword match → multiple hits: pick nearest
     """
     with _lock:
-        detections = list(_state['detections'])
+        detections = _dets_now_unlocked()
 
     kw = _keyword_match(description, detections)
     if not kw:
@@ -1233,7 +1325,7 @@ def nav_loop():
                 # disks so the push routes around them -- the target (at the goal)
                 # is excluded so we still drive into it.
                 if goal_mode == 'push':
-                    _add_detection_obstacles(grid, _get('detections'), goal_local)
+                    _add_detection_obstacles(grid, _dets_now(), goal_local)
                 # PUSH mode: the target IS an object (an obstacle in the grid), so
                 # plan on a copy with the cost cleared in a disk around the goal —
                 # A* then paths INTO the object instead of routing around it.
@@ -1362,7 +1454,8 @@ def nav_loop():
                                  range_min=float(scan.range_min),
                                  range_max=float(scan.range_max),
                                  n=len(scan.ranges)),
-                detections=dets_snap),
+                detections=dets_snap,
+                policy_belief=_get('policy_belief')),
                 frame=frame_rgb, frame_dets=dets_snap)
 
         time.sleep(0.05)
@@ -1437,7 +1530,7 @@ class NavRobot:
         q = name.lower().replace('_', ' ').strip()
         ox, oy, oyaw = _get('odom_x'), _get('odom_y'), _get('odom_yaw')
         best = None; tc = _get('target_color')
-        for d in _get('detections'):
+        for d in _dets_now():
             lbl = (d.get('label') or '').lower()
             if q in lbl or lbl in q or (q.split() and q.split()[0] in lbl):
                 if tc and d.get('color') != tc: continue      # colour-targeted command
@@ -1497,15 +1590,33 @@ class NavRobot:
 
     def _live_det(self, name):
         """Nearest current detection matching `name` (or apple, for a ball), in
-        the robot frame: {x_loc, y_loc, dist, lidar_dist, ...}. None if unseen."""
+        the robot frame NOW: {x_loc, y_loc, dist, lidar_dist, ...}, placed on the
+        map with the pose at capture (capture_pose) and re-expressed from there;
+        x_cap/y_cap/dist_cap/pose_cap/t_cap hold the frame's own values. None if unseen."""
         q = name.lower().replace('_', ' ').strip()
         best = None; tc = _get('target_color')
-        for d in _get('detections'):
+        # A ball cut off by the frame edge gives a biased bearing and range (see
+        # _box_on_edge); wait for a whole view instead. Not while shoving (the ball
+        # sits against the bumper, cut off at the bottom, and the push reads it
+        # frame-relative) and not for people (a person near the robot is nearly
+        # always cut off top and bottom).
+        whole_only = 'ball' in q and _get('goal_mode') != 'push'
+        for d in _dets_now():
+            if whole_only and d.get('edge'):
+                continue
             lbl = (d.get('label') or '').lower()
             if q in lbl or lbl in q or ('ball' in q and 'apple' in lbl):
                 if tc and d.get('color') != tc: continue      # colour-targeted command
                 if best is None or d.get('dist', 1e9) < best.get('dist', 1e9):
                     best = d
+        if best is not None and _get('goal_mode') == 'push' and 'x_cap' in best:
+            # Shoving: the ball moves WITH the robot between camera frames, so the
+            # sighting's fixed map point goes stale under the bumper and reads as
+            # "ball under the robot" (PUSH_TO_GOAL then re-lines-up forever: 1/10
+            # vs 6/10 layouts in the research repo's simulator). While pushing, use
+            # the frame's own robot-relative values, as before capture placement.
+            best = dict(best, x_loc=best['x_cap'], y_loc=best['y_cap'],
+                        dist=best.get('dist_cap', best.get('dist')))
         return best
 
     def _wall_goal(self, det):
@@ -1943,6 +2054,33 @@ class NavRobot:
         _set(status='push-to-goal timed out')
         return 'timeout'
 
+    def push_to_goal_rel(self, fwd, left, max_time=90.0):
+        """PUSH_TO_GOAL_REL: the hand-written push skill with the goal (fwd, left)
+        metres from where the robot stands now (a study layout's goal from its
+        taped start), and the same 90 s limit RUN_POLICY has: the study baseline."""
+        import policy_runner
+        gx, gy = policy_runner.goal_from_start((fwd, left), float(_get('odom_x')),
+                                               float(_get('odom_y')), float(_get('odom_yaw')))
+        return self.push_to_goal(gx, gy, max_time=float(max_time))
+
+    def run_policy_rel(self, path, fwd, left, max_time=90.0):
+        """RUN_POLICY_REL: like run_policy, with the goal (fwd, left) metres from
+        where the robot stands now — a study layout's goal from its taped start."""
+        return self.run_policy(path, max_time=max_time, rel=(fwd, left))
+
+    def run_policy(self, path, gx=None, gy=None, max_time=90.0, rel=None):
+        """RUN_POLICY: drive with a controller file (evo.policy_api contract), the
+        same file that was scored in simulation. Goal = (gx, gy) or the ball goal
+        marked in the UI. See policy_runner.py. Returns 'done' / 'settled' /
+        'timeout' / 'blocked' / 'no-goal' / 'error: ...'."""
+        import policy_runner
+        if not os.path.isabs(path):
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+        return policy_runner.run(path, get=_get, set_=_set, node=lambda: ros_node,
+                                 live_det=self._live_det, check=self._check,
+                                 goal=(gx, gy) if gx is not None and gy is not None else None,
+                                 goal_rel=rel, max_time=float(max_time))
+
     def follow(self, name=None, standoff=None, fast=None, max_time=900):
         """Follow the CLOSEST `name`, AVOIDING OBSTACLES on the way — a person to
         help them carry things, a dog, a ball, anything nameable.
@@ -2133,6 +2271,9 @@ _PLAN_PHRASE = {
     'PUSH_THROUGH': 'push it to the wall',
     'PUSH_TO_WALL': 'push it to the wall',
     'PUSH_TO_GOAL': 'line up behind the ball & push it to your goal',
+    'RUN_POLICY':   'push the ball to your goal with the loaded controller',
+    'RUN_POLICY_REL': 'push the ball to the layout goal with the loaded controller',
+    'PUSH_TO_GOAL_REL': 'line up behind the ball & push it to the layout goal',
     'FOLLOW':       'follow the target',
     'GO_TO':        'drive to the spot',
     'POINT':        'turn to face it',
@@ -2244,7 +2385,8 @@ def _run_program(meta, display=None):
         # handling), so reset it here along with the other per-run state.
         _set(run_active=False, nav_active=False, target_color=None,
              follow_target=None, follow_standoff=None, follow_scan_first=False,
-             follow_fast=False, goal_mode='move', push_from=None, ball_mark=None)
+             follow_fast=False, goal_mode='move', push_from=None, ball_mark=None,
+             policy_belief=None)
 
 
 # ── Flask routes ──────────────────────────────────────────────────────────────
@@ -2258,6 +2400,8 @@ def get_state():
         _hnow = time.time()
         resp = jsonify({
             'cam_ok':       (_hnow - _state['img_t'])  < 3.0,
+            'cam_lag':      _state['cam_lag'],
+            'cam_lag_src':  _state['cam_lag_src'],
             'lidar_ok':     (_hnow - _state['scan_t']) < 3.0,
             'base_ok':      (_hnow - _state['odom_t']) < 2.0,
             'destination':  _state['destination'],
@@ -2265,7 +2409,7 @@ def get_state():
             'match_info':   _state['match_info'],
             'nav_active':   _state['nav_active'],
             'goal_mode':    _state['goal_mode'],
-            'detections':   _state['detections'],
+            'detections':   _dets_now_unlocked(),
             'use_lidar_dist': _state['use_lidar_dist'],
             'planner':      {'robot_r': ROBOT_R, 'inflate_r': INFLATE_R,
                              'smooth_clear_m': SMOOTH_CLEAR_M},
@@ -2274,6 +2418,7 @@ def get_state():
             'odom_yaw':     round(math.degrees(_state['odom_yaw']), 1),
             'goal_odom':    _state['goal_odom'],
             'ball_goal':    _state['ball_goal'],
+            'policy_belief': _state['policy_belief'],
             'battery_voltage': _state['battery_voltage'],
             'battery_percentage': _state['battery_percentage'],
             'docked':       _state['docked'],
@@ -2531,7 +2676,7 @@ def lidar_png():
     with _lock:
         cached = _state['lidar_png']
         scan, path, gl = _state['scan'], _state['path'], _state['goal_local']
-        dets = list(_state['detections'])
+        dets = _dets_now_unlocked()
         ll = _state['look_local']
         gm = _state['goal_mode']
     png = cached or render_lidar_png(scan, path, gl, dets, ll, gm)

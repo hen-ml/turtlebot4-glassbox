@@ -94,7 +94,7 @@ class FakeBase:
     detection when it is in the field of view, and drives/serves go_to goals the
     way nav_loop does."""
 
-    FOV_HALF = 0.58          # rad — OAK-D 416 preview is ~65 deg across
+    FOV_HALF = 0.345         # rad — the 416 preview (centre crop) is ~39.5 deg across, see CAM_FX
     CONTACT = 0.30           # m — robot centre to ball centre while pushing
 
     def __init__(self, ball, pose=(0.0, 0.0, 0.0), rate=100.0):
@@ -210,12 +210,14 @@ class FakeBase:
             bx, by = self.ball
             d = math.hypot(nx - bx, ny - by)
             if d < self.CONTACT and v > 0.0:
-                # contact push: clamp the robot at the ball and roll the ball by
-                # however far the robot actually travelled
+                # contact push: the ball gives way by however far the robot would
+                # have entered it, along the robot->ball line. (It used to clamp the
+                # robot at the ball and roll the ball by the CLAMPED robot's travel,
+                # which is ~0 in steady contact: the robot crawled at ~1/10 of the
+                # commanded speed and pushes finished or not depending on timing.)
                 ux, uy = (nx - bx) / d, (ny - by) / d
-                nx, ny = bx + ux * self.CONTACT, by + uy * self.CONTACT
-                step = math.hypot(nx - x, ny - y)
-                self.ball = [bx - ux * step, by - uy * step]
+                push = self.CONTACT - d
+                self.ball = [bx - ux * push, by - uy * push]
                 self.ball_track.append(tuple(self.ball))
             tb4._set(odom_x=nx, odom_y=ny, odom_yaw=yaw, odom_t=time.time())
             self._publish_ball()

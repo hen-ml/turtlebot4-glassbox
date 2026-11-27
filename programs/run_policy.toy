@@ -1,0 +1,12 @@
+# name: run_policy
+# description: push the ball to the goal you marked, using the controller in policies/current.py
+# triggers: run the policy, run the controller, run the evolved controller, run policy
+# plan: push the ball to your goal with the loaded controller@RUN_POLICY
+#
+# Copy the controller to test to policies/current.py on the robot first (the
+# folder is git-ignored). Mark the ball goal in the web UI like PUSH_TO_GOAL.
+# Each run is logged to ~/policy_runs/ (one JSON line per 0.1 s tick).
+
+SET r = RUN_POLICY("policies/current.py")
+PRINT "Result:"
+PRINT r

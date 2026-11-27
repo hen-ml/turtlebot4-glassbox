@@ -85,6 +85,7 @@
     <div class="stat-row"><span>Robot</span><span id="ry">0.000</span></div>
     <div class="stat-row"><span>Goal</span><span id="goal_disp">—</span></div>
     <div class="stat-row"><span>Ball goal</span><span id="ballgoal_disp" style="color:#fc3;">—</span></div>
+    <div class="stat-row" title="RUN_POLICY: where the controller itself thinks the ball is (hollow cyan ring on the map), what it is doing, and how old that estimate is"><span>Policy belief</span><span id="belief_disp" style="color:#7ff;">—</span></div>
   </div>
 
   <!-- Row 2 LEFT: tell the robot what to do. -->
@@ -190,6 +191,12 @@ function update() {
     document.getElementById('ryaw').textContent = s.odom_yaw.toFixed(1);
     document.getElementById('goal_disp').textContent = s.goal_odom ? `(${s.goal_odom[0].toFixed(2)}, ${s.goal_odom[1].toFixed(2)})` : '—';
     document.getElementById('ballgoal_disp').textContent = s.ball_goal ? `(${s.ball_goal[0].toFixed(2)}, ${s.ball_goal[1].toFixed(2)})` : '—';
+    const pb = s.policy_belief;
+    document.getElementById('belief_disp').textContent = pb ? [
+      pb.ball ? `(${pb.ball[0].toFixed(2)}, ${pb.ball[1].toFixed(2)})` : 'no ball',
+      pb.mode || null,
+      (pb.ball && pb.age != null) ? `${pb.age.toFixed(1)} s old` : null,
+    ].filter(Boolean).join(' · ') : '—';
     const batt_pct = s.battery_percentage ? (s.battery_percentage * 100).toFixed(0) : '—';
     const batt_volt = s.battery_voltage ? s.battery_voltage.toFixed(2) : '—';
     document.getElementById('batt_pct').textContent = batt_pct;

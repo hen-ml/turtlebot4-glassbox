@@ -1,0 +1,300 @@
+"""RUN_POLICY: drive the robot with a controller file written against evo.policy_api.
+
+A policy file defines make_policy() (or class Policy) with reset(goal) and
+act(obs) -> (v, w) or (v, w, done). The same file runs in a simulator, so the
+observation here is built to match it exactly:
+
+    obs.x, obs.y, obs.yaw   odometry
+    obs.ball                where the ball was last seen, as the simulator defines it:
+                            {x_loc, y_loc} = the ball's CENTRE in the robot frame NOW,
+                            dist = range from the camera to that centre, age = s
+                            since the frame was taken. Each sighting is placed on the
+                            map ONCE, with the pose the robot had when the frame was
+                            captured (the navigator's capture_pose), and re-expressed
+                            relative to the robot every tick, so a static ball stays
+                            put however the robot moves between frames. The camera
+                            reports the visible surface relative to the lens, so we
+                            add the ball radius along the ray and the camera's offset
+                            (TB4_BALL_R, TB4_CAM_X). It stays after the ball leaves
+                            view, with age growing; None until first seen.
+    obs.goal                the ball goal (marked in the UI, or given)
+    obs.bump                a bump hazard message arrived since the last step (the
+                            navigator keeps its hazard list for ~2 s for the UI, so
+                            only fresh messages count)
+    obs.v, obs.w            measured from odometry over the last step
+    obs.scan, obs.scan_age  the RPLIDAR scan as LIDAR_BEAMS ranges in the robot frame
+                            (beam i at bearing -pi + 2*pi*i/n, beam 0 straight back),
+                            invalid or empty = LIDAR_MAX, as the simulator gives it
+
+Commands are clamped to |v| <= 0.30 m/s and |w| <= 1.0 rad/s. The run ends when
+the policy returns done, after `max_time`, when the robot has been commanded
+still for 3 s (same rule as the simulator), or on cliff / wheel drop. Every tick
+is logged to ~/policy_runs/<time>_<policy>.jsonl for replay and analysis.
+
+If the policy reports what it believes (an optional `belief`, see evo.policy_api),
+each tick also logs it as `belief` and the BEV draws its ball estimate, so the gap
+between what the camera saw (`raw`/`ball`) and what the controller acted on is
+visible live and recoverable afterwards. Policies that report nothing log null.
+
+This module has no ROS imports: NavRobot.run_policy passes in the accessors.
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import time
+
+from capture_pose import local_to_odom, odom_to_local
+from evo.policy_api import Obs, clamp_cmd, load_policy
+
+V_MAX, W_MAX = 0.30, 1.0
+TICK = 0.10            # s, 10 Hz like the simulator
+SETTLE = 3.0           # s commanded still -> end
+HAZARD_FRESH = 0.08    # s: under one control step: "pressed during the last step", as the simulator;
+                       # the Create 3 streams /hazard_detection while a bumper is pressed
+# Must match the simulator (sensing.cam_x, physics.ball_radius); set the measured
+# values on the robot with these environment variables.
+CAM_X = float(os.environ.get("TB4_CAM_X", "0.08"))    # m, camera ahead of the base centre
+BALL_R = float(os.environ.get("TB4_BALL_R", "0.11"))  # m, ball radius
+
+
+LIDAR_BEAMS = 36           # must match the simulator (sensing.lidar_beams, lidar_max, lidar_min)
+LIDAR_MAX = 6.0
+LIDAR_MIN = 0.15
+LIDAR_WINDOW = math.radians(2.5)   # samples within this of a beam's bearing make up the beam
+
+
+def scan_beams(scan, n=None, rmax=None, rmin=None):
+    """A sensor_msgs/LaserScan from the navigator -> n ranges in the robot frame.
+
+    The RPLIDAR is mounted yaw +90 deg from base_link (tb4_claude_nav build_grid:
+    base_x = -r*sin(a), base_y = r*cos(a)), so base bearing b is lidar angle
+    atan2(-cos b, sin b). Each beam is the median of the valid samples within
+    LIDAR_WINDOW of it; none valid -> rmax (the simulator's 'nothing seen')."""
+    n = LIDAR_BEAMS if n is None else n
+    rmax = LIDAR_MAX if rmax is None else rmax
+    rmin = LIDAR_MIN if rmin is None else rmin
+    rng = list(scan.ranges)
+    inc, a0 = float(scan.angle_increment), float(scan.angle_min)
+    lo = max(rmin, float(getattr(scan, "range_min", 0.0) or 0.0))
+    out = []
+    for i in range(n):
+        b = -math.pi + 2 * math.pi * i / n
+        target = math.atan2(-math.cos(b), math.sin(b))
+        vals = []
+        k0 = int(round((target - a0) / inc)) if inc else 0
+        span = int(math.ceil(LIDAR_WINDOW / abs(inc))) if inc else 0
+        for k in range(k0 - span, k0 + span + 1):
+            j = k % len(rng)
+            ang = a0 + k * inc
+            if abs(_wrap(ang - target)) > LIDAR_WINDOW + 1e-9:
+                continue
+            r = rng[j]
+            if r is not None and math.isfinite(r) and lo <= r <= rmax:
+                vals.append(float(r))
+        if vals:
+            vals.sort()
+            m = len(vals) // 2
+            out.append(round(vals[m] if len(vals) % 2 else 0.5 * (vals[m - 1] + vals[m]), 3))
+        else:
+            out.append(rmax)
+    return tuple(out)
+
+
+def ball_in_robot_frame(det, cam_x=None, ball_r=None):
+    """A navigator detection -> the policy API's ball.
+
+    The navigator gives x_loc/y_loc/dist relative to the camera, and its `dist`
+    is the distance to the ball's visible SURFACE (stereo depth over the box).
+    When it came from the p25 depth image it is depth along the optical axis,
+    not range. The simulator, and the policy, use the ball's CENTRE in the robot
+    frame and the range from the camera to it."""
+    cam_x = CAM_X if cam_x is None else cam_x
+    ball_r = BALL_R if ball_r is None else ball_r
+    x, y = float(det["x_loc"]), float(det["y_loc"])
+    brg = math.atan2(y, x)
+    surf = float(det.get("dist", math.hypot(x, y)))
+    p25 = det.get("p25_dist")
+    if p25 is not None and abs(surf - float(p25)) < 1e-9:
+        surf = surf / max(math.cos(brg), 0.5)          # depth along the axis -> range
+    d = surf + ball_r
+    return dict(x_loc=cam_x + d * math.cos(brg), y_loc=d * math.sin(brg), dist=d)
+LOG_DIR = os.path.expanduser("~/policy_runs")
+
+
+def read_belief(policy, t):
+    """The policy's optional self-report (evo.policy_api: `belief`), read after
+    every act(): where it thinks the ball is, how old that estimate is, and what
+    it is doing. Normalised to {ball: [x, y] odom, age: s, mode: str}, keeping
+    only the keys it gave; None if it reports nothing usable. Never raises: the
+    report feeds the log and the BEV, not control, so a malformed one is dropped
+    rather than ending the run."""
+    try:
+        b = getattr(policy, "belief", None)
+        if callable(b):
+            b = b()
+        if not isinstance(b, dict):
+            return None
+        out = {}
+        ball = b.get("ball")
+        if ball is not None:
+            x, y = float(ball[0]), float(ball[1])
+            if math.isfinite(x) and math.isfinite(y):
+                out["ball"] = [round(x, 3), round(y, 3)]
+        bt = b.get("ball_t")
+        if "ball" in out and bt is not None and math.isfinite(float(bt)):
+            out["age"] = round(max(0.0, float(t) - float(bt)), 2)
+        if b.get("mode") is not None:
+            out["mode"] = str(b["mode"])[:32]
+        return out or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _wrap(a):
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def goal_from_start(rel, ox, oy, oyaw):
+    """(forward, left) of the robot's pose now -> an odom point."""
+    f, l = float(rel[0]), float(rel[1])
+    return (ox + f * math.cos(oyaw) - l * math.sin(oyaw), oy + f * math.sin(oyaw) + l * math.cos(oyaw))
+
+
+def run(path, get, set_, node, live_det, check, goal=None, max_time=90.0, name="ball",
+        log_dir=LOG_DIR, sleep=time.sleep, clock=time.time, goal_rel=None):
+    """Returns 'done' / 'settled' / 'timeout' / 'blocked' / 'error: ...' / 'no-goal' / 'no-robot'.
+    goal_rel = (forward, left) metres from the robot's pose at the start, instead of
+    an odom goal: a study layout's goal measured from its taped start pose."""
+    if node() is None:
+        return "no-robot"
+    if goal_rel is not None:
+        goal = goal_from_start(goal_rel, float(get("odom_x")), float(get("odom_y")), float(get("odom_yaw")))
+    if goal is None or goal[0] is None:
+        g = get("ball_goal")
+        goal = (float(g[0]), float(g[1])) if g else None
+    if goal is None:
+        set_(status="no ball goal set: tick “Ball goal” and click the BEV")
+        return "no-goal"
+    goal = (float(goal[0]), float(goal[1]))
+    try:
+        policy = load_policy(path)
+        policy.reset(goal)
+    except Exception as e:  # noqa: BLE001
+        set_(status=f"policy rejected: {e}")
+        return f"error: {e}"
+
+    os.makedirs(log_dir, exist_ok=True)
+    tag = os.path.basename(path).removesuffix(".py")
+    logf = open(os.path.join(log_dir, time.strftime("%Y%m%d_%H%M%S_") + tag + ".jsonl"), "w")
+    logf.write(json.dumps(dict(kind="start", policy=path, goal=goal, goal_rel=goal_rel, t=clock(),
+                               cam_x=CAM_X, ball_r=BALL_R)) + "\n")
+
+    t0 = clock()
+    ball_odom, last_key, last_obj, last_raw, arrived = None, None, None, None, None
+    v_sent = w_sent = 0.0
+    v_meas = w_meas = 0.0
+    prev_od = None
+    scan, last_scan_t = None, None
+    still_since = None
+    result = "timeout"
+    set_(ball_goal=goal, goal_mode="push")           # a bump here is the ball, not a wall
+    try:
+        while True:
+            check()                                  # Stop button -> StopProgram
+            now = clock()
+            t = now - t0
+            if t >= max_time:
+                result = "timeout"
+                break
+            kinds = [h.get("type") for h in (get("hazards") or [])]
+            if "cliff" in kinds or "wheel_drop" in kinds:
+                result = "blocked"
+                break
+            ox, oy, oyaw = float(get("odom_x")), float(get("odom_y")), float(get("odom_yaw"))
+            det = live_det(name)
+            if det is not None and det.get("edge"):
+                det = None      # cut off by the frame edge: biased bearing and range; keep the last whole view
+            # a new frame saw the ball: a new capture time, or (unstamped detections)
+            # a new object; hold the last one so its identity cannot be reused
+            key = None if det is None else (det.get("t_cap") or det.get("t"))
+            if det is not None and (key != last_key if key is not None else det is not last_obj):
+                last_key, last_obj = key, det
+                # the frame's own values (the navigator re-expresses x_loc/y_loc for
+                # the current pose and keeps these as x_cap/y_cap/dist_cap)
+                cap = dict(x_loc=float(det.get("x_cap", det["x_loc"])),
+                           y_loc=float(det.get("y_cap", det["y_loc"])), p25_dist=det.get("p25_dist"))
+                d_cap = det.get("dist_cap", det.get("dist"))
+                if d_cap is not None:
+                    cap["dist"] = float(d_cap)
+                c = ball_in_robot_frame(cap)                 # centre, robot frame at capture
+                pose_cap = det.get("pose_cap") or (ox, oy, oyaw)
+                ball_odom = local_to_odom((c["x_loc"], c["y_loc"]), pose_cap)   # fixed from now on
+                # age from when the frame was taken (t_cap), else when it arrived (t),
+                # else this tick
+                t_det = det.get("t_cap", det.get("t"))
+                arrived = now if t_det is None else min(now, float(t_det))
+                last_raw = dict(x_loc=round(cap["x_loc"], 3), y_loc=round(cap["y_loc"], 3),
+                                dist=round(float(cap.get("dist", 0.0)), 3), src=det.get("cap_src"),
+                                lag=(round(float(det["t"]) - float(det["t_cap"]), 3)
+                                     if det.get("t") is not None and det.get("t_cap") is not None else None))
+            ball = None
+            if ball_odom is not None:
+                lx, ly = odom_to_local(ball_odom, (ox, oy, oyaw))
+                ball = dict(x_loc=lx, y_loc=ly, dist=math.hypot(lx - CAM_X, ly), age=round(now - arrived, 3))
+            t_od = get("odom_t") or now
+            if prev_od is not None and t_od - prev_od[3] > 1e-3:        # a new odometry sample
+                dt_od = t_od - prev_od[3]
+                hd = prev_od[2] + 0.5 * _wrap(oyaw - prev_od[2])
+                v_meas = ((ox - prev_od[0]) * math.cos(hd) + (oy - prev_od[1]) * math.sin(hd)) / dt_od
+                w_meas = _wrap(oyaw - prev_od[2]) / dt_od
+            if prev_od is None or t_od - prev_od[3] > 1e-3:
+                prev_od = (ox, oy, oyaw, t_od)
+            fresh_bump = "bump" in kinds and now - float(get("last_hazard_t") or 0.0) <= HAZARD_FRESH
+            sc, sc_t = get("scan"), get("scan_t")
+            if sc is not None and sc_t != last_scan_t:
+                scan, last_scan_t = scan_beams(sc), sc_t
+            scan_age = round(now - float(last_scan_t), 3) if scan is not None else 0.0
+            obs = Obs(t=round(t, 3), x=ox, y=oy, yaw=oyaw, ball=ball, goal=goal,
+                      bump=fresh_bump, v=v_meas, w=w_meas, scan=scan, scan_age=scan_age)
+            try:
+                v, w, done = clamp_cmd(policy.act(obs), V_MAX, W_MAX)
+            except Exception as e:  # noqa: BLE001
+                result = f"error: {type(e).__name__}: {e}"
+                break
+            belief = read_belief(policy, obs.t)
+            set_(policy_belief=belief)
+            logf.write(json.dumps(dict(t=round(t, 3), x=round(ox, 3), y=round(oy, 3), yaw=round(oyaw, 3),
+                                       ball=ball, raw=last_raw, bump=obs.bump,
+                                       ball_odom=(None if ball_odom is None
+                                                  else [round(ball_odom[0], 3), round(ball_odom[1], 3)]), v=round(v, 3), w=round(w, 3),
+                                       v_meas=round(v_meas, 3), w_meas=round(w_meas, 3),
+                                       scan=scan if scan is not None and scan_age < 0.05 else None,
+                                       belief=belief, done=done)) + "\n")
+            if done:
+                result = "done"
+                break
+            if abs(v) < 0.01 and abs(w) < 0.02:
+                still_since = now if still_since is None else still_since
+                if now - still_since >= SETTLE:
+                    result = "settled"
+                    break
+            else:
+                still_since = None
+            node().send_twist(v, w)
+            v_sent, w_sent = v, w
+            if ball_odom is not None:
+                set_(ball_mark=tuple(ball_odom))
+            set_(status=f"policy {tag}: v={v:+.2f} w={w:+.2f}"
+                        + (f" ball {ball['dist']:.2f} m (age {ball['age']:.1f}s)" if ball else " ball not seen"))
+            sleep(max(0.0, TICK - (clock() - now)))
+    finally:
+        n = node()
+        if n is not None:
+            n.send_twist(0.0, 0.0)
+        set_(goal_mode="move", policy_belief=None)
+        logf.write(json.dumps(dict(kind="end", result=result, t=round(clock() - t0, 3))) + "\n")
+        logf.close()
+    set_(status=f"policy {tag}: {result}")
+    return result

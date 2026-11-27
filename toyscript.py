@@ -13,6 +13,12 @@ Primitives (provided by a Robot binding):
     PUSH_TO_WALL([name])   lidar-goal + camera-steer wall push     -> "pinned"/...
     PUSH_TO_GOAL([x, y])   push the ball to a human-set goal       -> "at goal"/...
                            (no args = the goal marked in the web UI)
+    RUN_POLICY(file[, x, y]) drive with a controller file (evo.policy_api)  -> "done"/"settled"/...
+                           (no x, y = the goal marked in the web UI)
+    RUN_POLICY_REL(file, fwd, left)  same, goal = (fwd, left) m from where the robot
+                           stands when it starts (study layouts: no clicking)
+    PUSH_TO_GOAL_REL(fwd, left[, secs])  PUSH_TO_GOAL with such a goal, 90 s limit
+                           by default (the study's baseline)
     FOLLOW([name][, m][, fast])
                            follow at a standoff (move, not push)   -> "done"/"not-found"
                            With NO arguments the target, the standoff and `fast`
@@ -266,6 +272,9 @@ class Interpreter:
         elif N == "FOLLOW":       a = ([str(args[0])] if len(args) > 0 else []) \
                                     + ([self._num(args[1])] if len(args) > 1 else []) \
                                     + ([self._truthy(args[2])] if len(args) > 2 else []); fn = self.robot.follow
+        elif N == "RUN_POLICY":   a = [str(args[0])] + ([self._num(args[1]), self._num(args[2])] if len(args) >= 3 else []); fn = self.robot.run_policy
+        elif N == "PUSH_TO_GOAL_REL": a = [self._num(args[0]), self._num(args[1])] + ([self._num(args[2])] if len(args) >= 3 else []); fn = self.robot.push_to_goal_rel
+        elif N == "RUN_POLICY_REL": a = [str(args[0]), self._num(args[1]), self._num(args[2])];             fn = self.robot.run_policy_rel
         elif N == "EXPLORE":      a = [self._num(args[0]) if args else 900];                            fn = self.robot.explore_open
         elif N == "PHOTO":        a = [];                                                                 fn = self.robot.photo
         else:
@@ -359,6 +368,12 @@ class MockRobot:
         self.log(f"  [robot] FOLLOW {name} standoff={standoff:.1f}m"
                  + (" (predict + lidar-track)" if fast else ""))
         return "done"
+    def run_policy(self, path, gx=None, gy=None, max_time=90.0):
+        self.log(f"  [robot] RUN_POLICY {path}"); return "done"
+    def push_to_goal_rel(self, fwd, left, max_time=90.0):
+        self.log(f"  [robot] PUSH_TO_GOAL_REL goal fwd={fwd:.2f} left={left:.2f} ({max_time:.0f} s)"); return "at goal"
+    def run_policy_rel(self, path, fwd, left, max_time=90.0):
+        self.log(f"  [robot] RUN_POLICY_REL {path} goal fwd={fwd:.2f} left={left:.2f}"); return "done"
     def explore_open(self, max_time=900, reach=2.0):
         self.log(f"  [robot] EXPLORE max_time={max_time}"); return "done"
     def find(self, name):
