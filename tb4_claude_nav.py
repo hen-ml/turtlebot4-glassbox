@@ -239,6 +239,7 @@ def _wrap_angle(a):
 # Odometry history, so each camera sighting is placed with the pose the robot had
 # when the frame was taken (capture_pose.py), not the pose when it arrived.
 _pose_hist = capture_pose.PoseHistory()
+_scan_hist = capture_pose.Stamped(16)       # ~2 s of 8 Hz scans, to range a detection at its capture
 
 def _dets_now_unlocked():
     """_state['detections'] as seen from the robot's pose now (caller holds _lock):
@@ -823,6 +824,7 @@ class NavNode(Node):
                              durability=DurabilityPolicy.VOLATILE,
                              history=HistoryPolicy.KEEP_LAST, depth=5)
         self._depth = None
+        self._depth_hist = capture_pose.Stamped(6)   # ~3 s of 2 fps depth, matched to detections by stamp
         self.create_subscription(LaserScan,        '/scan',                       self._scan_cb,  qos_s)
         self.create_subscription(Image,            CAM_TOPIC,                     self._img_cb,   qos_cam)
         self.create_subscription(Image,            DEPTH_TOPIC,                   self._depth_cb, qos_cam)
@@ -867,6 +869,7 @@ class NavNode(Node):
             return False
 
     def _scan_cb(self, msg: LaserScan):
+        _scan_hist.add(capture_pose.msg_time(msg, time.time()), msg)
         with _lock:
             _state['scan']      = msg
             _state['scan_t']    = time.time()
@@ -895,13 +898,20 @@ class NavNode(Node):
         try:
             if '16' in msg.encoding:
                 self._depth = np.frombuffer(bytes(msg.data), np.uint16).reshape(msg.height, msg.width)
+                self._depth_hist.add(capture_pose.msg_time(msg, time.time()), self._depth)
         except Exception:
             pass
 
-    def _p25_depth(self, x_px, y_px, w_px, h_px):
+    def _p25_depth(self, x_px, y_px, w_px, h_px, t=None):
         """p25 of stereo depth (m) over the box; maps 416 preview -> depth via
-        center-square-crop geometry. None if no depth/too few valid pixels."""
+        center-square-crop geometry. None if no depth/too few valid pixels.
+        With `t` (the detection's capture time) it reads the depth frame from
+        that moment, not the newest one, which looks elsewhere while turning."""
         d = self._depth
+        if t is not None:
+            dt = self._depth_hist.nearest(t)[1]
+            if dt is not None:
+                d = dt
         if d is None:
             return None
         H, W = d.shape
@@ -945,8 +955,9 @@ class NavNode(Node):
             bc, bs = det.bbox.center.position, det.bbox.size
             x_px=float(bc.x); y_px=float(bc.y); w_px=float(bs.x); h_px=float(bs.y)
             bearing = -math.atan((x_px - CAM_CX) / CAM_FX)   # real preview intrinsics
-            ld = _lidar_range_at_bearing(_get("scan"), bearing)
-            p25 = self._p25_depth(x_px, y_px, w_px, h_px)
+            sc = _scan_hist.nearest(t_cap)[1]
+            ld = _lidar_range_at_bearing(sc if sc is not None else _get("scan"), bearing)
+            p25 = self._p25_depth(x_px, y_px, w_px, h_px, t=t_cap)
             if _get("use_lidar_dist"):
                 # p25 of stereo depth over the box (correct box->depth align) reads
                 # the ball true even when the spatial NN reports the wall behind it.

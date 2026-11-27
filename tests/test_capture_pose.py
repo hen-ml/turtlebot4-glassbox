@@ -76,6 +76,24 @@ class PlaceAndReexpress(unittest.TestCase):
         self.assertIs(CP.dets_now([det], (5.0, 5.0, 1.0))[0], det)
 
 
+class StampedFrames(unittest.TestCase):
+    def test_pairs_a_detection_with_the_frame_from_its_capture(self):
+        h = CP.Stamped(6)
+        for k in range(5):
+            h.add(100.0 + 0.5 * k, f"depth{k}")            # 2 fps
+        self.assertEqual(h.nearest(101.05), (101.0, "depth2"))
+        self.assertEqual(h.nearest(None), (102.0, "depth4"))
+        self.assertEqual(h.nearest(50.0), (102.0, "depth4"), "nothing near: fall back to the newest")
+        self.assertEqual(CP.Stamped().nearest(1.0), (None, None))
+
+    def test_message_time_from_its_header(self):
+        NS = __import__("types").SimpleNamespace
+        msg = NS(header=NS(stamp=NS(sec=99, nanosec=500_000_000)))
+        self.assertAlmostEqual(CP.msg_time(msg, 100.0), 99.5)
+        self.assertEqual(CP.msg_time(NS(), 100.0), 100.0)     # no header: arrival
+        self.assertEqual(CP.msg_time(NS(header=NS(stamp=NS(sec=0, nanosec=0))), 100.0), 100.0)
+
+
 class Navigator:
     """The camera -> navigator -> RUN_POLICY path, as on the robot: frames every
     1/hz s, delivered `lag` s later, placed with capture_pose exactly as

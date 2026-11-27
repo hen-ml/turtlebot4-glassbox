@@ -122,3 +122,34 @@ def dets_now(dets, pose):
         out.append(dict(d, x_cap=d["x_loc"], y_cap=d["y_loc"], dist_cap=d.get("dist"),
                         x_loc=lx, y_loc=ly, dist=math.hypot(lx, ly)))
     return out
+
+
+class Stamped:
+    """The last few sensor messages by time, so a detection can be paired with
+    the depth frame / lidar scan from its own capture instead of the newest one
+    (while the robot turns, the newest depth frame looks somewhere else)."""
+
+    def __init__(self, maxlen=8):
+        self._q = deque(maxlen=maxlen)
+
+    def add(self, t, item):
+        self._q.append((float(t), item))
+
+    def nearest(self, t, max_dt=0.3):
+        """(stamp, item) nearest t if within max_dt, else the latest (as before
+        this existed); (None, None) if empty."""
+        q = list(self._q)
+        if not q:
+            return None, None
+        if t is not None:
+            best = min(q, key=lambda p: abs(p[0] - t))
+            if abs(best[0] - t) <= max_dt:
+                return best
+        return q[-1]
+
+
+def msg_time(msg, now):
+    """A message's header stamp if plausible against its arrival `now`, else `now`."""
+    st = getattr(getattr(msg, "header", None), "stamp", None)
+    stamp = (st.sec + st.nanosec * 1e-9) if st is not None and hasattr(st, "sec") else None
+    return capture_time(stamp, now, default_lag=0.0)[0]
