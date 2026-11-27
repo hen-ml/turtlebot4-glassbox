@@ -211,6 +211,22 @@ class TestObservationMatchesTheSimulator(unittest.TestCase):
             self.assertAlmostEqual(d["x_loc"], 0.5, places=3)       # being pushed: moves with us
             tb4._set(goal_mode="move", detections=[])
 
+    def test_every_unstamped_detection_is_a_new_frame(self):
+        """Detections without t/t_cap (test worlds) are new frames by object, not by
+        id(): a recycled id must not make a fresh detection look stale."""
+        pol = _write_policy(self.logdir, "        return (0.0, 0.0, obs.t > 1.0)\n")
+        frames = iter(range(10**6))
+
+        def live_det(name):                      # a NEW dict every tick, like FakeBase
+            next(frames)
+            return dict(label="sports ball", x_loc=1.0, y_loc=0.0, dist=1.0)
+        tb4._set(ball_goal=(2.0, 0.0))
+        with FakeBase((3.0, 3.0)):
+            policy_runner.run(pol, get=tb4._get, set_=tb4._set, node=lambda: tb4.ros_node,
+                              live_det=live_det, check=lambda: None, log_dir=self.logdir)
+        ages = [x["ball"]["age"] for x in self._log() if x.get("ball")]
+        self.assertTrue(ages and max(ages) < 0.05, ages[:20])
+
     def test_toyscript_verb(self):
         import toyscript
         out = []
