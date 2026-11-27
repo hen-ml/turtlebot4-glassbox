@@ -145,6 +145,17 @@ CAM_TOPIC     = "/oakd/rgb/preview/image_raw"      # OAK-D RGB preview
 # turning in place agree best at fx 565-580; the ball's scatter fell 7.2 -> 2.1 cm.
 CAM_FX        = 579.45
 CAM_CX        = 215.86
+PREVIEW_PX    = 416       # the square preview YOLO runs on
+EDGE_PX       = 3         # a box within this many px of the preview border is cut off by the frame
+
+
+def _box_on_edge(x_px, y_px, w_px, h_px, size=PREVIEW_PX, margin=EDGE_PX):
+    """True if a detection box touches the preview border. The object is cut off,
+    so the box centre (bearing) and the depth over the box (range) are biased:
+    on the robot 2026-11-26 a ball half out of frame read 1.38 m instead of 1.0 m
+    and PUSH_TO_GOAL declared 'at goal' from it."""
+    return (x_px - w_px / 2.0 <= margin or x_px + w_px / 2.0 >= size - margin or
+            y_px - h_px / 2.0 <= margin or y_px + h_px / 2.0 >= size - margin)
 DEPTH_TOPIC   = "/oakd/stereo/image_raw"   # raw stereo depth (16UC1 mm) for p25 distance
 IMG_REFRESH_HZ = 2.0       # 2 fps
 # ─────────────────────────────────────────────────────────────────────────────
@@ -990,6 +1001,7 @@ class NavNode(Node):
                 p25_dist=(float(p25) if p25 is not None else None),
                 x_px=float(bc.x), y_px=float(bc.y),
                 w_px=float(bs.x), h_px=float(bs.y),
+                edge=_box_on_edge(x_px, y_px, w_px, h_px),   # cut off by the frame: biased
                 color=(_detect_color(frame, x_px, y_px, w_px, h_px) if label != 'person' else None),
             ))
         capture_pose.place(dets, pose_cap, t_cap, cap_src)   # odom point per sighting, fixed from now on
@@ -1583,7 +1595,15 @@ class NavRobot:
         x_cap/y_cap/dist_cap/pose_cap/t_cap hold the frame's own values. None if unseen."""
         q = name.lower().replace('_', ' ').strip()
         best = None; tc = _get('target_color')
+        # A ball cut off by the frame edge gives a biased bearing and range (see
+        # _box_on_edge); wait for a whole view instead. Not while shoving (the ball
+        # sits against the bumper, cut off at the bottom, and the push reads it
+        # frame-relative) and not for people (a person near the robot is nearly
+        # always cut off top and bottom).
+        whole_only = 'ball' in q and _get('goal_mode') != 'push'
         for d in _dets_now():
+            if whole_only and d.get('edge'):
+                continue
             lbl = (d.get('label') or '').lower()
             if q in lbl or lbl in q or ('ball' in q and 'apple' in lbl):
                 if tc and d.get('color') != tc: continue      # colour-targeted command

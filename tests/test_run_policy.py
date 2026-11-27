@@ -363,5 +363,49 @@ class TestCameraIntrinsics(unittest.TestCase):
         self.assertAlmostEqual(hfov, 39.5, delta=0.3)
 
 
+class TestEdgeBoxes(unittest.TestCase):
+    """A ball cut off by the frame edge gives a biased bearing and range (on the robot:
+    1.38 m instead of 1.0 m, and PUSH_TO_GOAL declared 'at goal' from it)."""
+
+    def test_box_on_edge(self):
+        e = tb4._box_on_edge
+        self.assertTrue(e(391, 260, 48, 106))        # the false 'at goal' sighting, 2026-11-26
+        self.assertTrue(e(27, 284, 54, 63))          # half out on the left
+        self.assertTrue(e(208, 390, 60, 60))         # cut off at the bottom (close ball)
+        self.assertFalse(e(299, 260, 48, 48))        # the same ball, whole, a moment later
+        self.assertFalse(e(208, 208, 24, 24))
+
+    def _det(self, label, edge, x=1.0):
+        return dict(label=label, conf=0.9, x_loc=x, y_loc=0.0, dist=x, edge=edge)
+
+    def test_ball_skills_wait_for_a_whole_view(self):
+        with FakeBase((5.0, 5.0)):
+            nav = tb4.NavRobot()
+            tb4._set(detections=[self._det("sports ball", True)], goal_mode="move")
+            self.assertIsNone(nav._live_det("ball"))
+            tb4._set(detections=[self._det("sports ball", True, 0.5), self._det("sports ball", False, 1.5)])
+            self.assertAlmostEqual(nav._live_det("ball")["x_loc"], 1.5)   # the whole one, though farther
+            tb4._set(detections=[self._det("sports ball", True)], goal_mode="push")
+            self.assertIsNotNone(nav._live_det("ball"), "while shoving the ball is always cut off")
+            tb4._set(detections=[self._det("person", True)], goal_mode="move")
+            self.assertIsNotNone(nav._live_det("person"), "people near the robot are always cut off")
+            tb4._set(detections=[], goal_mode="move")
+
+    def test_run_policy_never_hands_the_controller_an_edge_box(self):
+        d = tempfile.mkdtemp()
+        pol = _write_policy(d, "        return (0.0, 0.0, obs.t > 1.0)\n")
+        logs = tempfile.mkdtemp()
+        with FakeBase((5.0, 5.0)):
+            tb4._set(ball_goal=(2.0, 0.0))
+            policy_runner.run(pol, get=tb4._get, set_=tb4._set, node=lambda: tb4.ros_node,
+                              live_det=lambda name: dict(label="sports ball", x_loc=1.0, y_loc=0.0,
+                                                         dist=1.0, t=time.time(), edge=True),
+                              check=lambda: None, log_dir=logs, max_time=3.0)
+        with open(os.path.join(logs, os.listdir(logs)[0])) as f:
+            ticks = [json.loads(line) for line in f if '"kind"' not in line]
+        self.assertTrue(ticks)
+        self.assertTrue(all(t["ball"] is None for t in ticks), "an edge box reached the controller")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -214,6 +214,8 @@ def run(path, get, set_, node, live_det, check, goal=None, max_time=90.0, name="
                 break
             ox, oy, oyaw = float(get("odom_x")), float(get("odom_y")), float(get("odom_yaw"))
             det = live_det(name)
+            if det is not None and det.get("edge"):
+                det = None      # cut off by the frame edge: biased bearing and range; keep the last whole view
             # a new frame saw the ball: a new capture time, or (unstamped detections)
             # a new object; hold the last one so its identity cannot be reused
             key = None if det is None else (det.get("t_cap") or det.get("t"))
