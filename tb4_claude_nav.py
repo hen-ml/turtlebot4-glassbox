@@ -143,7 +143,7 @@ CAM_TOPIC     = "/oakd/rgb/preview/image_raw"      # OAK-D RGB preview
 # up to ~1.7x, so a static object swung across the map as it moved in the image.
 # Measured on the robot 2026-11-26: pairs of sightings of a static object taken while
 # turning in place agree best at fx 565-580; the ball's scatter fell 7.2 -> 2.1 cm.
-CAM_FX        = 579.45
+CAM_FX        = capture_pose.PREVIEW_FX   # 579.45
 CAM_CX        = 215.86
 PREVIEW_PX    = 416       # the square preview YOLO runs on
 EDGE_PX       = 3         # a box within this many px of the preview border is cut off by the frame

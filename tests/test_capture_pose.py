@@ -102,6 +102,44 @@ class StampedFrames(unittest.TestCase):
         self.assertEqual(CP.msg_time(NS(header=NS(stamp=NS(sec=0, nanosec=0))), 100.0), 100.0)
 
 
+class BallSize(unittest.TestCase):
+    def w_for(self, dia, dist):
+        return CP.BOX_K * CP.PREVIEW_FX * dia / dist
+
+    def test_sizes_the_cal_ball(self):
+        s = CP.BallSizer(default=0.11)
+        self.assertEqual(s.radius(), 0.11)                       # nothing seen yet
+        for d in (0.6, 0.9, 1.3, 1.6):
+            s.add(dict(w_px=self.w_for(0.172, d), dist=d))
+        self.assertAlmostEqual(s.radius(), 0.086, places=3)
+        # the real sightings of 2026-11-26: box width x distance ~ 104 px m
+        r = CP.BallSizer()
+        for w, d in ((80, 1.32), (94, 1.09), (108, 1.02), (125, 0.90), (147, 0.67), (179, 0.58)):
+            r.add(dict(w_px=w, dist=d))
+        self.assertAlmostEqual(r.radius(), 0.086, delta=0.005)
+
+    def test_skips_bad_sightings_and_resists_an_outlier(self):
+        s = CP.BallSizer(default=0.11)
+        self.assertIsNone(s.add(dict(w_px=200, dist=0.4)))                 # too close
+        self.assertIsNone(s.add(dict(w_px=10, dist=2.0)))                  # tiny box
+        self.assertIsNone(s.add(dict(w_px=90, dist=1.2, edge=True)))       # cut off by the frame
+        self.assertIsNone(s.add(dict(w_px=90)))                            # no distance
+        for d in (0.8, 1.0, 1.2):
+            s.add(dict(w_px=self.w_for(0.172, d), dist=d))
+        s.add(dict(w_px=self.w_for(0.172, 1.0), dist=2.2))                 # stereo read the background
+        self.assertAlmostEqual(s.radius(), 0.086, delta=0.004)
+
+    def test_override_and_clamp(self):
+        s = CP.BallSizer(default=0.11, override=0.05)
+        for d in (0.8, 1.0, 1.2):
+            s.add(dict(w_px=self.w_for(0.172, d), dist=d))
+        self.assertEqual(s.radius(), 0.05)
+        big = CP.BallSizer()
+        for d in (0.8, 1.0, 1.2):
+            big.add(dict(w_px=self.w_for(0.6, d), dist=d))
+        self.assertEqual(big.radius(), 0.15)
+
+
 class Navigator:
     """The camera -> navigator -> RUN_POLICY path, as on the robot: frames every
     1/hz s, delivered `lag` s later, placed with capture_pose exactly as
@@ -109,8 +147,9 @@ class Navigator:
     re-expressed for the current pose, as tb4_claude_nav._live_det does."""
     HALF_FOV = math.atan(208 / 325.95)                     # OAK-D 416 preview
 
-    def __init__(self, ball, hz=2.0, lag=0.3, stamped=True, assumed_lag=0.3, at_arrival=False):
+    def __init__(self, ball, hz=2.0, lag=0.3, stamped=True, assumed_lag=0.3, at_arrival=False, ball_r=None):
         self.ball, self.hz, self.lag, self.stamped, self.assumed = ball, hz, lag, stamped, assumed_lag
+        self.ball_r = PR.BALL_R if ball_r is None else ball_r      # the true ball
         self.at_arrival = at_arrival        # the old behaviour: place with the pose when it arrived
         t0 = 1000.0                                        # a real-looking clock: stamps > 0
         self.st = dict(t=t0, x=0.0, y=0.0, yaw=0.0, v=0.0, w=0.0)
@@ -127,8 +166,9 @@ class Navigator:
             lx, ly = CP.odom_to_local(self.ball, (cx, cy, yaw))
             brg, rc = math.atan2(ly, lx), math.hypot(lx, ly)
             if lx > 0 and abs(brg) <= self.HALF_FOV:
-                surf = rc - PR.BALL_R                       # the navigator reports the visible surface
-                d = dict(label="sports ball", x_loc=surf * math.cos(brg), y_loc=surf * math.sin(brg), dist=surf)
+                surf = rc - self.ball_r                     # the navigator reports the visible surface
+                d = dict(label="sports ball", x_loc=surf * math.cos(brg), y_loc=surf * math.sin(brg), dist=surf,
+                         w_px=CP.BOX_K * CP.PREVIEW_FX * 2 * self.ball_r / surf, edge=False)
                 self.pending.append((tc + self.lag, tc, d))
             else:
                 self.pending.append((tc + self.lag, tc, None))
@@ -232,6 +272,23 @@ class StaticBallUnderRunPolicy(unittest.TestCase):
         passes the 1 cm bar, the tests above no longer measure anything."""
         worst = max(max(self._errors(Navigator(b, lag=0.3, at_arrival=True), g)[0]) for b, g in LAYOUTS)
         self.assertGreater(worst, 0.05)
+
+    def test_a_smaller_ball_is_sized_and_stays_put(self):
+        """A 0.086 m ball while the runner starts from its 0.11 default: the camera
+        sizes it, and the static ball still stays put on the map."""
+        ball, goal = LAYOUTS[2]
+        nav = Navigator(ball, lag=0.3, ball_r=0.086)
+        ticks, _ = nav.run(goal)
+        self.assertAlmostEqual(ticks[0]["ball_r"], PR.BALL_R)              # the default until sized
+        self.assertAlmostEqual(ticks[-1]["ball_r"], 0.086, places=3)
+        sized = [r for r in ticks if r["ball_odom"] and abs(r["ball_r"] - 0.086) < 1e-3
+                 and math.hypot(r["x"] - ball[0], r["y"] - ball[1]) >= self.CONTACT]
+        self.assertGreater(len(sized), 10)
+        # placements made once the ball was sized (a sighting placed earlier with the
+        # default radius is held until the next frame, so skip a frame's worth)
+        late = sized[6:]
+        worst = max(math.hypot(r["ball_odom"][0] - ball[0], r["ball_odom"][1] - ball[1]) for r in late)
+        self.assertLess(worst, 0.01)
 
     def test_seed_policy_still_reaches_and_pushes_the_ball(self):
         ball, goal = LAYOUTS[1]

@@ -15,8 +15,13 @@ observation here is built to match it exactly:
                             put however the robot moves between frames. The camera
                             reports the visible surface relative to the lens, so we
                             add the ball radius along the ray and the camera's offset
-                            (TB4_BALL_R, TB4_CAM_X). It stays after the ball leaves
-                            view, with age growing; None until first seen.
+                            (TB4_CAM_X; the TurtleBot 4 Lite camera is 3.7 cm behind
+                            the base centre). The radius is estimated from the camera
+                            as the run goes (capture_pose.BallSizer: box width x
+                            distance; median of the first whole sightings), so it
+                            need not be set per ball; TB4_BALL_R fixes it instead.
+                            It stays after the ball leaves view, with age growing;
+                            None until first seen.
     obs.goal                the ball goal (marked in the UI, or given)
     obs.bump                a bump hazard message arrived since the last step (the
                             navigator keeps its hazard list for ~2 s for the UI, so
@@ -57,7 +62,9 @@ HAZARD_FRESH = 0.08    # s: under one control step: "pressed during the last ste
 # Must match the simulator (sensing.cam_x, physics.ball_radius); set the measured
 # values on the robot with these environment variables.
 CAM_X = capture_pose.CAM_X                            # m, camera ahead of the base centre (TB4_CAM_X)
-BALL_R = float(os.environ.get("TB4_BALL_R", "0.11"))  # m, ball radius: set it for the ball in use
+BALL_R = 0.11                                         # m, ball radius until the camera has sized the ball
+BALL_R_OVERRIDE = os.environ.get("TB4_BALL_R")        # m, fixes the radius (no estimate)
+ESTIMATE_BALL_R = True                                # estimate it from the camera (capture_pose.BallSizer)
 
 
 LIDAR_BEAMS = 36           # must match the simulator (sensing.lidar_beams, lidar_max, lidar_min)
@@ -190,10 +197,12 @@ def run(path, get, set_, node, live_det, check, goal=None, max_time=90.0, name="
     tag = os.path.basename(path).removesuffix(".py")
     logf = open(os.path.join(log_dir, time.strftime("%Y%m%d_%H%M%S_") + tag + ".jsonl"), "w")
     logf.write(json.dumps(dict(kind="start", policy=path, goal=goal, goal_rel=goal_rel, t=clock(),
-                               cam_x=CAM_X, ball_r=BALL_R)) + "\n")
+                               cam_x=CAM_X, ball_r=BALL_R, ball_r_override=BALL_R_OVERRIDE,
+                               ball_r_estimate=ESTIMATE_BALL_R)) + "\n")
 
     t0 = clock()
     ball_odom, last_key, last_obj, last_raw, arrived = None, None, None, None, None
+    sizer = capture_pose.BallSizer(default=BALL_R, override=BALL_R_OVERRIDE)
     v_sent = w_sent = 0.0
     v_meas = w_meas = 0.0
     prev_od = None
@@ -229,7 +238,10 @@ def run(path, get, set_, node, live_det, check, goal=None, max_time=90.0, name="
                 d_cap = det.get("dist_cap", det.get("dist"))
                 if d_cap is not None:
                     cap["dist"] = float(d_cap)
-                c = ball_in_robot_frame(cap)                 # centre, robot frame at capture
+                if ESTIMATE_BALL_R:
+                    sizer.add(dict(w_px=det.get("w_px"), dist=cap.get("dist"), edge=det.get("edge")))
+                ball_r = sizer.radius()
+                c = ball_in_robot_frame(cap, ball_r=ball_r)  # centre, robot frame at capture
                 pose_cap = det.get("pose_cap") or (ox, oy, oyaw)
                 ball_odom = local_to_odom((c["x_loc"], c["y_loc"]), pose_cap)   # fixed from now on
                 # age from when the frame was taken (t_cap), else when it arrived (t),
@@ -272,7 +284,7 @@ def run(path, get, set_, node, live_det, check, goal=None, max_time=90.0, name="
                                                   else [round(ball_odom[0], 3), round(ball_odom[1], 3)]), v=round(v, 3), w=round(w, 3),
                                        v_meas=round(v_meas, 3), w_meas=round(w_meas, 3),
                                        scan=scan if scan is not None and scan_age < 0.05 else None,
-                                       belief=belief, done=done)) + "\n")
+                                       belief=belief, ball_r=round(sizer.radius(), 4), done=done)) + "\n")
             if done:
                 result = "done"
                 break
@@ -295,7 +307,9 @@ def run(path, get, set_, node, live_det, check, goal=None, max_time=90.0, name="
         if n is not None:
             n.send_twist(0.0, 0.0)
         set_(goal_mode="move", policy_belief=None)
-        logf.write(json.dumps(dict(kind="end", result=result, t=round(clock() - t0, 3))) + "\n")
+        logf.write(json.dumps(dict(kind="end", result=result, ball_r=round(sizer.radius(), 4),
+                                   ball_r_estimate=(None if sizer.estimate() is None else round(sizer.estimate(), 4)),
+                                   ball_r_n=sizer.n, t=round(clock() - t0, 3))) + "\n")
         logf.close()
     set_(status=f"policy {tag}: {result}")
     return result

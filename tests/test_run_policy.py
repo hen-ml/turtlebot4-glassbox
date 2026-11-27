@@ -44,11 +44,12 @@ class TestRunPolicy(unittest.TestCase):
         policy_runner.LOG_DIR = self.logdir
         # FakeBase publishes the ball centre relative to the base, so no camera
         # offset or radius to add in this world.
-        self._saved = (policy_runner.CAM_X, policy_runner.BALL_R)
+        self._saved = (policy_runner.CAM_X, policy_runner.BALL_R, policy_runner.ESTIMATE_BALL_R)
         policy_runner.CAM_X, policy_runner.BALL_R = 0.0, 0.0
+        policy_runner.ESTIMATE_BALL_R = False     # FakeBase's boxes are a fixed 24 px, not a real ball
 
     def tearDown(self):
-        policy_runner.CAM_X, policy_runner.BALL_R = self._saved
+        policy_runner.CAM_X, policy_runner.BALL_R, policy_runner.ESTIMATE_BALL_R = self._saved
 
     def _run(self, ball, goal, max_time=60.0):
         tb4._set(ball_goal=goal)
@@ -255,11 +256,12 @@ class TestPolicyBelief(unittest.TestCase):
 
     def setUp(self):
         self.logdir = tempfile.mkdtemp()
-        self._saved = (policy_runner.CAM_X, policy_runner.BALL_R)
+        self._saved = (policy_runner.CAM_X, policy_runner.BALL_R, policy_runner.ESTIMATE_BALL_R)
         policy_runner.CAM_X, policy_runner.BALL_R = 0.0, 0.0
+        policy_runner.ESTIMATE_BALL_R = False     # FakeBase's boxes are a fixed 24 px, not a real ball
 
     def tearDown(self):
-        policy_runner.CAM_X, policy_runner.BALL_R = self._saved
+        policy_runner.CAM_X, policy_runner.BALL_R, policy_runner.ESTIMATE_BALL_R = self._saved
         tb4._set(policy_belief=None)
 
     def _ticks(self):

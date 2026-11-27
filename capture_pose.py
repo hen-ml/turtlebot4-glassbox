@@ -158,3 +158,68 @@ def msg_time(msg, now):
     st = getattr(getattr(msg, "header", None), "stamp", None)
     stamp = (st.sec + st.nanosec * 1e-9) if st is not None and hasattr(st, "sec") else None
     return capture_time(stamp, now, default_lag=0.0)[0]
+
+
+# Focal length (px) of the 416 preview YOLO runs on: the centre 720x720 of the
+# 1280x720 RGB frame (fx 1002.91) resized to 416 (see tb4_claude_nav CAM_FX).
+PREVIEW_FX = 579.45
+# YOLO box width / the ball's true angular diameter. Calibrated 2026-11-26 on a ball
+# 54 cm round (diameter 0.172 m): box width x surface distance ~= 104 px m over 7
+# whole sightings at 0.5-1.6 m, i.e. 1.0435 x fx x diameter.
+BOX_K = 1.0435
+
+
+class BallSizer:
+    """The ball's radius, estimated from the camera, so it need not be set per ball.
+
+    Each whole sighting gives diameter ~= w_px * distance / (BOX_K * PREVIEW_FX), with
+    `distance` the stereo distance to the ball's visible surface (the navigator's
+    `dist`). Sightings cut off by the frame edge, closer than `rng[0]` (stereo and
+    boxes degrade) or farther than `rng[1]`, or smaller than `min_w` px are skipped.
+    radius() is the override if given (TB4_BALL_R); else the median of the
+    estimates once there are `min_n`, clamped to `clamp`; else `default`. The median
+    keeps the occasional stereo reading of the background (seen on a dark ball)
+    from dominating."""
+
+    def __init__(self, default=0.11, override=None, min_n=3, rng=(0.5, 2.5), min_w=15.0,
+                 clamp=(0.03, 0.15), fx=None, box_k=None):
+        self.default, self.override = float(default), (None if override is None else float(override))
+        self.min_n, self.rng, self.min_w, self.clamp = min_n, rng, min_w, clamp
+        self.fx = PREVIEW_FX if fx is None else fx
+        self.box_k = BOX_K if box_k is None else box_k
+        self.estimates = []
+
+    def add(self, det):
+        """Take one sighting (needs w_px and dist; skips edge boxes). Returns the
+        diameter estimate used, or None if the sighting was skipped."""
+        try:
+            w, d = det.get("w_px"), det.get("dist")
+            if w is None or d is None or det.get("edge"):
+                return None
+            w, d = float(w), float(d)
+        except (TypeError, ValueError, AttributeError):
+            return None
+        if not (self.rng[0] <= d <= self.rng[1]) or w < self.min_w:
+            return None
+        dia = w * d / (self.box_k * self.fx)
+        self.estimates.append(dia)
+        return dia
+
+    @property
+    def n(self):
+        return len(self.estimates)
+
+    def estimate(self):
+        """Median-based radius from the sightings so far, or None if too few."""
+        if len(self.estimates) < self.min_n:
+            return None
+        e = sorted(self.estimates)
+        m = len(e) // 2
+        med = e[m] if len(e) % 2 else 0.5 * (e[m - 1] + e[m])
+        return min(self.clamp[1], max(self.clamp[0], med / 2.0))
+
+    def radius(self):
+        if self.override is not None:
+            return self.override
+        r = self.estimate()
+        return self.default if r is None else r
